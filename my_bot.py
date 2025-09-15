@@ -68,6 +68,52 @@ MAX_NOTIONAL_PCT = 0.01
 FEE_PCT          = 0.0006
 SLIPPAGE_PCT     = 0.0005
 
+# Портфельные лимиты
+MAX_OPEN_POS = 3
+
+# Кулдаун между входами по одному символу
+TRADE_COOLDOWN_BARS = 3
+
+# =========================
+#      И Н И Ц И А Л И З А Ц И Я
+# =========================
+exchange = ccxt.bingx({
+    'apiKey': BINGX_API_KEY,
+    'secret': BINGX_SECRET_KEY,
+    'options': {
+        'defaultType': 'swap',
+    },
+    'enableRateLimit': True,
+})
+
+def load_markets_safe():
+    for _ in range(2):
+        try:
+            return exchange.load_markets(reload=True)
+        except Exception as e:
+            print("Warning: load_markets:", e)
+            time.sleep(1)
+    return exchange.markets or {}
+
+markets = load_markets_safe()
+
+# Алиасы на бирже (пример: MATIC ребренд → POL)
+SYMBOL_ALIASES = {
+    'MATIC': 'POL',
+    'XBT': 'BTC',
+}
+
+def normalize_contract_symbol(sym: str) -> str:
+    """Приводим тикер к виду, который есть на бирже, с учетом алиасов."""
+    try:
+        base = sym.split('/')[0].upper()
+        if base in SYMBOL_ALIASES:
+            new_base = SYMBOL_ALIASES[base]
+            return sym.replace(base + '/USDT:USDT', new_base + '/USDT:USDT')
+    except Exception:
+        pass
+    return sym
+
 # =========================
 #      В С Е Л Е Н Н А Я
 # =========================
@@ -141,46 +187,6 @@ def build_universe():
 # Загружаем список
 SYMBOLS_TO_TRADE = build_universe()
 print("[BOT] Торгуемые символы:", ", ".join(SYMBOLS_TO_TRADE))
-
-# =========================
-#      И Н И Ц И А Л И З А Ц И Я
-# =========================
-exchange = ccxt.bingx({
-    'apiKey': BINGX_API_KEY,
-    'secret': BINGX_SECRET_KEY,
-    'options': {
-        'defaultType': 'swap',
-    },
-    'enableRateLimit': True,
-})
-
-def load_markets_safe():
-    for _ in range(2):
-        try:
-            return exchange.load_markets(reload=True)
-        except Exception as e:
-            print("Warning: load_markets:", e)
-            time.sleep(1)
-    return exchange.markets or {}
-
-markets = load_markets_safe()
-
-# Алиасы на бирже (пример: MATIC ребренд → POL)
-SYMBOL_ALIASES = {
-    'MATIC': 'POL',
-    'XBT': 'BTC',
-}
-
-def normalize_contract_symbol(sym: str) -> str:
-    """Приводим тикер к виду, который есть на бирже, с учетом алиасов."""
-    try:
-        base = sym.split('/')[0].upper()
-        if base in SYMBOL_ALIASES:
-            new_base = SYMBOL_ALIASES[base]
-            return sym.replace(base + '/USDT:USDT', new_base + '/USDT:USDT')
-    except Exception:
-        pass
-    return sym
 
 # =========================
 #          Х Е Л П Е Р Ы
@@ -309,6 +315,35 @@ def write_daily_report(prev_day, eq_start, eq_end, events, max_dd):
     except Exception as e:
         print("write_daily_report error:", e)
 
+def report_rollover(usdt_balance):
+    """
+    Пишем отчёт при смене календарного дня.
+    """
+    today = date.fromtimestamp(time.time())
+    # первый вызов — инициализация
+    if state.get("_report_day") is None:
+        state["_report_day"] = today
+        state["last_equity"] = usdt_balance
+        return
+
+    # если наступил новый день — пишем отчёт за предыдущий
+    if today != state["_report_day"]:
+        prev_day = state["_report_day"]
+        eq_start = state.get("eq_start")
+        eq_end   = state.get("last_equity", usdt_balance)
+        max_dd   = state.get("max_dd", 0.0)
+        try:
+            write_daily_report(prev_day, eq_start, eq_end, state.get("events", []), max_dd)
+        except Exception as e:
+            print("write_daily_report error:", e)
+        # rollover
+        state["_report_day"] = today
+        state["events"] = []
+        state["max_dd"] = 0.0
+
+    # обновляем последнюю известную equity
+    state["last_equity"] = usdt_balance
+
 # =========================
 #        Г Л О Б А Л Ь Н О Е  С О С Т О Я Н И Е
 # =========================
@@ -322,6 +357,7 @@ state = {
     "sl_orders": {},
     "tp_orders": {},
     "events": [],
+    "_report_day": None,   # <--- для ротации отчёта по датам
 }
 
 # =========================
@@ -1379,6 +1415,7 @@ def can_trade_today(usdt_eq):
         print(f"{PRINT_PREFIX} Новый торговый день: equity start = {usdt_eq:.2f} USDT | MODE={MODE}")
         return True
     dd = (state['eq_start'] - usdt_eq) / max(state['eq_start'], 1)
+    state['max_dd'] = max(state.get('max_dd', 0.0), dd)
     if dd >= MAX_DAILY_DD:
         print(f"{PRINT_PREFIX} Достигнут дневной стоп {dd*100:.2f}% >= {MAX_DAILY_DD*100:.2f}% — торговля пауза")
         return False
@@ -1438,7 +1475,14 @@ def main():
             for symbol in SYMBOLS_TO_TRADE:
                 print("\n" + "="*72)
                 print(f"[{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC] Анализ {symbol}")
-
+                # Жёсткий рантайм-фильтр исключений (на всякий случай)
+                base = symbol.split('/')[0].upper().replace(':USDT','')
+                if base in UNIVERSE_EXCLUDE:
+                    reason = f"{symbol}: в списке исключений — пропуск"
+                    print(reason)
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol, "reason": reason})
+                    continue
+                    
                 if is_locked(symbol):
                     left = state["pump_lock"].get(symbol, 0)
                     reason = f"{symbol}: pump lock активен ещё {left} бар(ов) — пропуск"
@@ -1548,10 +1592,8 @@ def main():
             manage_positions(df_for_manage)
 
             # --- Ежедневный отчёт ---
-            try:
-                write_daily_report(exchange, '/home/{}/crypto-bot/daily_report.txt'.format(os.getenv('USER','ubuntu')))
-            except Exception as e:
-                print("daily_report warn:", e)
+            if usdt_balance is not None:
+                report_rollover(usdt_balance)
 
             align_to_next_candle(tf_sec)
 
