@@ -62,11 +62,16 @@ UNIVERSE_EXCLUDE = {
 LEVERAGE         = 35     # фиксируем, чтобы не сбивалось на 5х
 RISK_PER_TRADE   = 0.005
 RISK_REWARD      = 1.5
-SL_ATR_MULT      = 3.5
+SL_ATR_MULT      = 2.5
 TP_ATR_MULT      = SL_ATR_MULT * RISK_REWARD
 MAX_NOTIONAL_PCT = 0.01
 FEE_PCT          = 0.0006
 SLIPPAGE_PCT     = 0.0005
+
+# --- Динамический множитель SL ---
+SL_ATR_MIN_MULT = 1.8
+SL_ATR_MAX_MULT = 3.2
+SL_ATR_PCT_PIVOTS = (0.004, 0.012)  # 0.4% → низкая вола; 1.2% → высокая вола
 
 # Портфельные лимиты
 MAX_OPEN_POS = 4
@@ -78,6 +83,9 @@ TRADE_COOLDOWN_BARS = 3
 MANAGE_FAST_LOOP    = True     # включить быстрые проверки
 MANAGE_EVERY_SEC    = 20       # как часто дергать manage_positions, сек
 MANAGE_TF_FOR_OPEN  = "1m"     # ТФ, на котором обновляем индикаторы для уже открытых позиций
+
+REENTRY_LOCK_BARS_AFTER_STOP = 6    # минимум 6 закрытых баров «тишины» по монете
+MAX_LOSSES_PER_SYMBOL_PER_DAY = 1   # не больше 1 убыточной попытки в день по символу
 
 # =========================
 #      И Н И Ц И А Л И З А Ц И Я
@@ -248,6 +256,21 @@ def now_utc():
 def utc_hour():
     return now_utc().hour
 
+def debounce_ok(symbol: str, price_now: float, closed_bar_ts, min_pct=0.003, min_bars=2):
+    """
+    Не даёт перезаходить сразу:
+      - цена должна уйти от прошлой цены сигнала минимум на min_pct (0.3% по умолчанию)
+      - и/или должно пройти не меньше min_bars закрытых баров.
+    """
+    lp = state["last_signal_price"].get(symbol)
+    lt = state["last_signal_ts"].get(symbol)
+    if lp is None or lt is None:
+        return True
+    moved_enough = abs(price_now - lp) / max(lp, 1e-9) >= min_pct
+    bars_passed = (closed_bar_ts > lt)
+    # Требуем либо движение, либо «минимум два новых бара» (в твоём цикле по закрытиям это выполнится последовательно)
+    return moved_enough or bars_passed
+
 # =========================
 #        Л О Г И  /  О Т Ч Ё Т Ы
 # =========================
@@ -379,11 +402,39 @@ state = {
     "tp_orders": {},
     "events": [],
     "_report_day": None,   # <--- для ротации отчёта по датам
+    "_prev_positions": {},
+    "last_signal_price": {},      # symbol -> float (последняя цена входа по сигналу)
+    "last_signal_ts": {},         # symbol -> pd.Timestamp (время закрытого бара сигнала)
+    "last_sl_hit_ts": {},         # symbol -> pd.Timestamp (когда выбило по SL)
+
 }
 
 # Дополнительные состояния
 state.setdefault("best_sl", {})              # чтобы SL не откатывался назад
 state.setdefault("debounce_ts", {"TP": {}, "SL": {}})  # анти-спам TP/SL
+
+def note_loss_for_symbol(symbol: str, df_symbol: pd.DataFrame):
+    """Отмечаем факт убыточного закрытия по символу: фиксация бара + инкремент счётчика."""
+    try:
+        if df_symbol is not None and len(df_symbol) >= 2:
+            ts = df_symbol.iloc[-2]["timestamp"]
+        else:
+            ts = now_utc()
+        # 2 строки, о которых ты спрашивал:
+        state["last_stop_bar"][symbol] = ts
+        state["losses_today_by_symbol"][symbol] = state["losses_today_by_symbol"].get(symbol, 0) + 1
+
+        ensure_json_log({
+            "ts": now_utc().isoformat(),
+            "event": "LOSS_MARK",
+            "symbol": symbol,
+            "reason": "loss registered (post-stop lock ON)"
+        })
+    except Exception as e:
+        print(f"{symbol}: note_loss_for_symbol warn: {e}")
+
+if "last_stop_bar" not in state: state["last_stop_bar"] = {}
+if "losses_today_by_symbol" not in state: state["losses_today_by_symbol"] = {}
 
 # =========================
 #      Т А Й М Ф Р Е Й М Ы  /  П А Р А М Е Т Р Ы
@@ -400,9 +451,9 @@ USE_IMPULSE       = CFG["USE_IMPULSE"]
 LOOKBACK_BREAKOUT = CFG["LOOKBACK_BREAKOUT"]
 
 # Управление позицией (BE/Trail и частичные TP)
-BREAKEVEN_AT_R        = 1.0   # было 0.8 → меньше ложных BE
-TRAIL_AT_R            = 1.5   # было 1.2 → трейл позже, когда уже «едем»
-TRAIL_ATR_MULT        = 1.8
+BREAKEVEN_AT_R        = 1.2   # было 0.8 → меньше ложных BE
+TRAIL_AT_R            = 1.8   # было 1.2 → трейл позже, когда уже «едем»
+TRAIL_ATR_MULT        = 2.2
 PARTIAL_TP_ENABLE     = True
 PARTIAL_TP_R          = 0.8   # частичный TP на 0.8R
 PARTIAL_TP_PART       = 0.5
@@ -424,7 +475,7 @@ VOL_ANOM_MULT = 2.0
 
 # Метод стопа: ATR (как раньше) или SWING (по LH/LL)
 SL_METHOD = "SWING"     # "ATR" или "SWING"
-SWING_LOOKBACK = 7      # 5–9 для 5m/15m оптимально
+SWING_LOOKBACK = 8      # 5–9 для 5m/15m оптимально
 
 # Funding-фильтры (ставка за 8ч)
 FUNDING_SOFT_ABS = 0.0005    # 0.05% — снизить риск x0.5
@@ -454,6 +505,15 @@ TP_PRICE_TOL_PCT       = 0.0005   # 5 bps «не хуже»
 # Памп-лок
 PUMP_LOCK_BARS = 3
 LATE_BREAKOUT_ATR_MULT = 1.2
+
+# --- Антишум / антипила ---
+MIN_ATR_PCT = 0.003                 # минимальная волатильность: ATR >= 0.30% цены (иначе «пила»)
+WICK_MAX_TO_BODY = 1.2              # любая тень > 1.2 * тело → бар шумный
+WICK_MAX_FRACTION_OF_RANGE = 0.6    # и одновременно тень > 60% всего диапазона бара → шум
+CHOP_LOOKBACK = 12                   # окно для детекции «пилы» по пересечениям KC_mid
+CHOP_MAX_KC_MID_CROSSES = 5         # макс. пересечений KC_mid за окно (>= → считаем «пилой»)
+TREND_STRICT = True                  # строгий тренд-фильтр (EMA-стек + «наклон» EMA20)
+EMA_SLOPE_LOOKBACK = 5              # окно для оценки наклона (EMA20 растёт/падает)
 
 # =========================
 #      Д А Н Н Ы Е
@@ -745,6 +805,83 @@ def late_breakout_guard(prev, atr_mult=LATE_BREAKOUT_ATR_MULT):
         return vol_ok
     return True
 
+def dyn_sl_mult(atr_value: float, price: float) -> float:
+    """
+    Возвращает SL-множитель в диапазоне [SL_ATR_MIN_MULT .. SL_ATR_MAX_MULT]
+    в зависимости от относительного ATR (ATR/price).
+    """
+    atr_pct = atr_value / max(price, 1e-9)
+    lo, hi = SL_ATR_PCT_PIVOTS
+    if atr_pct <= lo:
+        return SL_ATR_MIN_MULT
+    if atr_pct >= hi:
+        return SL_ATR_MAX_MULT
+    # линейная интерполяция
+    k = (atr_pct - lo) / max(hi - lo, 1e-9)
+    return SL_ATR_MIN_MULT + k * (SL_ATR_MAX_MULT - SL_ATR_MIN_MULT)
+
+def bar_wick_ok(row, max_wick_to_body=WICK_MAX_TO_BODY, max_wick_frac=WICK_MAX_FRACTION_OF_RANGE):
+    """
+    Фильтр «соплей»: отклоняем бар, если верхняя или нижняя тень
+    одновременно слишком велика относительно тела и всего диапазона бара.
+    """
+    try:
+        o = float(row['open']); c = float(row['close'])
+        h = float(row['high']); l = float(row['low'])
+        body = abs(c - o)
+        rng  = max(h - l, 1e-12)
+        upper = max(0.0, h - max(o, c))
+        lower = max(0.0, min(o, c) - l)
+
+        if body <= 1e-12:
+            return False  # чистый пин-бар/додж — считаем шумом для входов
+
+        if upper / body > max_wick_to_body and upper / rng > max_wick_frac:
+            return False
+        if lower / body > max_wick_to_body and lower / rng > max_wick_frac:
+            return False
+        return True
+    except Exception:
+        return True  # в сомнении — не блокируем
+
+def is_choppy_kc_mid(df, lookback=CHOP_LOOKBACK, max_crosses=CHOP_MAX_KC_MID_CROSSES):
+    """
+    Детектор «пилы»: слишком частые смены стороны относительно KC_mid.
+    """
+    try:
+        if df is None or len(df) < lookback + 2:
+            return False
+        w = df.iloc[-lookback-2:-2]
+        sign = np.sign((w['close'] - w['KC_mid']).values)
+        # количество смен знака (пересечений)
+        crosses = int(np.sum(np.abs(np.diff(sign)) > 0))
+        return crosses >= max_crosses
+    except Exception:
+        return False
+
+def ema_trend_ok(df, side: str, slope_lookback=EMA_SLOPE_LOOKBACK):
+    """
+    Строгий тренд-фильтр:
+    - стек EMA20 > EMA50 > EMA200 (для LONG) или обратный (для SHORT)
+    - наклон EMA20 за окно slope_lookback в сторону сделки
+    """
+    try:
+        if df is None or len(df) < slope_lookback + 2:
+            return False
+        r = df.iloc[-2]
+        if side == 'LONG':
+            stacked = (r['EMA20'] > r['EMA50'] > r['EMA200'])
+        else:
+            stacked = (r['EMA20'] < r['EMA50'] < r['EMA200'])
+        if not stacked:
+            return False
+        e20 = df['EMA20'].iloc[-slope_lookback-2:-2].values
+        slope = e20[-1] - e20[0]
+        return (slope > 0) if side == 'LONG' else (slope < 0)
+    except Exception:
+        return False
+
+
 # =========================
 #        С И Г Н А Л Ы
 # =========================
@@ -761,6 +898,9 @@ def impulse_signal(df, lookback=20, atr_k=0.2, body_frac_min=0.6, htf=None):
         return "HOLD", "Недостаточно данных для импульса"
 
     prev = df.iloc[-2]
+    # подавим импульс, если на закрытом баре «сопли» или пилообразный рынок
+    if not bar_wick_ok(prev) or is_choppy_kc_mid(df):
+        return "HOLD", "Импульс подавлен: шум/пила"
     atr  = float(prev['ATR'])
     rng  = float(prev['high'] - prev['low'])
     body = float(abs(prev['close'] - prev['open']))
@@ -806,6 +946,19 @@ def generate_signal(df, d_htf, symbol, regime):
     prev2 = df.iloc[-3]
     prev  = df.iloc[-2]
 
+    # 0) волатильность слишком мала → «пила»
+    atr_pct = float(prev['ATR']) / max(float(prev['close']), 1e-9)
+    if atr_pct < MIN_ATR_PCT:
+        return "HOLD", f"Низкая волатильность (ATR {atr_pct:.3%}) — пила"
+    
+    # 1) «сопли» на последнем закрытом баре
+    if not bar_wick_ok(prev):
+        return "HOLD", "Длинные тени (сопли) — шум"
+    
+    # 2) «пила» по пересечениям KC_mid
+    if is_choppy_kc_mid(df):
+        return "HOLD", "Пилообразный рынок (частые пересечения KC_mid)"
+
     # Pump alert — экстремальный выход за Keltner с объёмом
     kc_span = float(prev['KC_upper'] - prev['KC_lower'])
     if kc_span > 0:
@@ -823,6 +976,13 @@ def generate_signal(df, d_htf, symbol, regime):
         return (p['close'] <= p['VWAP20'] and p['close'] <= p['KC_mid']
                 and p['MACD_hist'] < 0 and p['MACD'] < p['MACD_sig'])
 
+    # Строгий тренд-фильтр (EMA стек + наклон EMA20) на LTF и HTF
+    trend_ok_long  = True
+    trend_ok_short = True
+    if TREND_STRICT:
+        trend_ok_long  = ema_trend_ok(df, 'LONG')  and ema_trend_ok(d_htf, 'LONG')
+        trend_ok_short = ema_trend_ok(df, 'SHORT') and ema_trend_ok(d_htf, 'SHORT')
+
     # LONG по RSI-cross + MACD
     if prev2['RSI'] < RSI_OVERSOLD and prev['RSI'] >= RSI_OVERSOLD and bullish_conf(prev):
         allow_long, _ = regime_filter(regime["btc_dominance"], regime["dxy_trend"], symbol)
@@ -830,7 +990,15 @@ def generate_signal(df, d_htf, symbol, regime):
             return "HOLD", "Фильтр режима: LONG запрещён"
         if not late_breakout_guard(prev):
             return "HOLD", "Поздний пробой без объёма"
-        return "LONG", "RSI выход + MACD + выше VWAP/KC_mid"
+        if prev2['RSI'] < RSI_OVERSOLD and prev['RSI'] >= RSI_OVERSOLD and bullish_conf(prev):
+            if not trend_ok_long:
+                return "HOLD", "Тренд-фильтр: EMA-стек/наклон не подтверждают LONG"
+            allow_long, _ = regime_filter(regime["btc_dominance"], regime["dxy_trend"], symbol)
+            if not allow_long:
+                return "HOLD", "Фильтр режима: LONG запрещён"
+            if not late_breakout_guard(prev):
+                return "HOLD", "Поздний пробой без объёма"
+            return "LONG", "RSI выход + MACD + выше VWAP/KC_mid (trend OK)"
 
     # SHORT по RSI-cross + MACD
     if prev2['RSI'] > RSI_OVERBOUGHT and prev['RSI'] <= RSI_OVERBOUGHT and bearish_conf(prev):
@@ -839,19 +1007,38 @@ def generate_signal(df, d_htf, symbol, regime):
             return "HOLD", "Фильтр режима: SHORT запрещён"
         if not late_breakout_guard(prev):
             return "HOLD", "Поздний пробой без объёма"
-        return "SHORT", "RSI выход + MACD + ниже VWAP/KC_mid"
+        if prev2['RSI'] > RSI_OVERBOUGHT and prev['RSI'] <= RSI_OVERBOUGHT and bearish_conf(prev):
+            if not trend_ok_short:
+                return "HOLD", "Тренд-фильтр: EMA-стек/наклон не подтверждают SHORT"
+            _, allow_short = regime_filter(regime["btc_dominance"], regime["dxy_trend"], symbol)
+            if not allow_short:
+                return "HOLD", "Фильтр режима: SHORT запрещён"
+            if not late_breakout_guard(prev):
+                return "HOLD", "Поздний пробой без объёма"
+            return "SHORT", "RSI выход + MACD + ниже VWAP/KC_mid (trend OK)"
 
     # Импульс
     if USE_IMPULSE:
         lb = LOOKBACK_BREAKOUT if MODE == "TEST" else max(LOOKBACK_BREAKOUT, 20)
-        s2, r2 = impulse_signal(df, lookback=lb, atr_k=0.2, body_frac_min=0.6, htf=d_htf)
-        if s2 != "HOLD":
-            allow_long, allow_short = regime_filter(regime["btc_dominance"], regime["dxy_trend"], symbol)
-            if s2 == "LONG" and not allow_long:
-                return "HOLD", "Фильтр режима: LONG запрещён (импульс)"
-            if s2 == "SHORT" and not allow_short:
-                return "HOLD", "Фильтр режима: SHORT запрещён (импульс)"
-            return s2, r2
+    
+        # подавим импульс, если бар «шумный» или рынок «пила»
+        if not bar_wick_ok(prev) or is_choppy_kc_mid(df):
+            pass
+        else:
+            s2, r2 = impulse_signal(df, lookback=lb, atr_k=0.2, body_frac_min=0.6, htf=d_htf)
+            if s2 != "HOLD":
+                allow_long, allow_short = regime_filter(regime["btc_dominance"], regime["dxy_trend"], symbol)
+                if s2 == "LONG":
+                    if not trend_ok_long:
+                        return "HOLD", "Тренд-фильтр (импульс): LONG не подтверждён EMA/наклоном"
+                    if not allow_long:
+                        return "HOLD", "Фильтр режима: LONG запрещён (импульс)"
+                if s2 == "SHORT":
+                    if not trend_ok_short:
+                        return "HOLD", "Тренд-фильтр (импульс): SHORT не подтверждён EMA/наклоном"
+                    if not allow_short:
+                        return "HOLD", "Фильтр режима: SHORT запрещён (импульс)"
+                return s2, r2
 
     return "HOLD", "Нет конвергенции сигналов"
 
@@ -1032,16 +1219,17 @@ def place_trade(symbol, signal, df, usdt_balance_cached=None, positions_map=None
 
     last_price = float(df.iloc[-1]['close'])
     atr_val = float(df.iloc[-1]['ATR'])
-
+    sl_mult = dyn_sl_mult(atr_val, last_price)
+    
     # --- SL/TP базовые ---
     if SL_METHOD.upper() == "SWING":
         sw = swing_stop_from(df, side_long=(signal == 'LONG'))
         if sw is None:
-            sl = (last_price - SL_ATR_MULT * atr_val) if signal == 'LONG' else (last_price + SL_ATR_MULT * atr_val)
+            sl = (last_price - sl_mult * atr_val) if signal == 'LONG' else (last_price + sl_mult * atr_val)
         else:
             sl = sw
     else:
-        sl = (last_price - SL_ATR_MULT * atr_val) if signal == 'LONG' else (last_price + SL_ATR_MULT * atr_val)
+        sl = (last_price - sl_mult * atr_val) if signal == 'LONG' else (last_price + sl_mult * atr_val)
 
     tp = (last_price + TP_ATR_MULT * atr_val) if signal == 'LONG' else (last_price - TP_ATR_MULT * atr_val)
     side = 'buy' if signal == 'LONG' else 'sell'
@@ -1363,6 +1551,7 @@ def manage_positions(df_map):
       - Перевод SL в BE при R >= BREAKEVEN_AT_R
       - Трейл SL при R >= TRAIL_AT_R
       - Никогда не двигаем SL назад (только в плюс)
+      - Два TP (частичный TP1 и финальный TP2)
       - Обеспечиваем наличие TP/SL; дозаводим если их нет
     """
     if DRY_RUN:
@@ -1387,18 +1576,16 @@ def manage_positions(df_map):
             last  = float(m.iloc[-1]['close'])
             atr   = float(m.iloc[-1]['ATR'])
 
-            # Базовые уровни по модели
+            # Базовые уровни
             base_tp = entry + TP_ATR_MULT * atr if side_long else entry - TP_ATR_MULT * atr
             base_sl_atr = entry - SL_ATR_MULT * atr if side_long else entry + SL_ATR_MULT * atr
-
-            # Можно использовать SWING-стоп в сопровождении при желании
             if SL_METHOD.upper() == "SWING":
                 sw = swing_stop_from(m, side_long=side_long)
                 base_sl = sw if (sw is not None) else base_sl_atr
             else:
                 base_sl = base_sl_atr
 
-            # Текущий SL биржи (если отдаёт)
+            # Текущий SL
             sl_current = float(p.get('stopLossPrice') or 0.0)
             effective_sl_for_r = sl_current if sl_current != 0 else base_sl
 
@@ -1409,65 +1596,75 @@ def manage_positions(df_map):
             upnl_per_unit = (last - entry) if side_long else (entry - last)
             R_now = upnl_per_unit / risk_per_unit
 
-            # Целевой SL (BE / Trail)
+            # Новый SL (BE / Trail)
             new_sl = base_sl
-            if R_now >= BREAKEVEN_AT_R:      # в безубыток
+            if R_now >= BREAKEVEN_AT_R:      # BE
                 new_sl = entry
-            if R_now >= TRAIL_AT_R:          # трейлим по ATR от текущей цены
+            if R_now >= TRAIL_AT_R:          # трейл
                 trail_sl = (last - TRAIL_ATR_MULT * atr) if side_long else (last + TRAIL_ATR_MULT * atr)
                 if side_long:
                     new_sl = max(new_sl, trail_sl)
                 else:
                     new_sl = min(new_sl, trail_sl)
 
-            # Округление
             new_sl_r = round_price(symbol, new_sl)
-            tp_r     = round_price(symbol, base_tp)
 
-            # Никогда не откатываем SL назад:
+            # Никогда не откатываем SL назад
             best = state["best_sl"].get(symbol)
             if best is not None:
                 if side_long:
                     new_sl_r = max(new_sl_r, best)
                 else:
                     new_sl_r = min(new_sl_r, best)
-            # Сохраняем «лучший» SL
-            if best is None:
-                state["best_sl"][symbol] = new_sl_r
-            else:
-                if side_long and new_sl_r > best:
-                    state["best_sl"][symbol] = new_sl_r
-                if (not side_long) and new_sl_r < best:
-                    state["best_sl"][symbol] = new_sl_r
+            state["best_sl"][symbol] = new_sl_r
 
-            # Проверка открытых ордеров
+            # Проверка ордеров
             opens = fetch_open_orders_safe(symbol)
-            have_tp = _tp_present_good_enough(symbol, side_long, tp_r)
             have_sl = any(is_sl_order(o) for o in opens)
 
-            # Дозавод TP, если его нет
-            if ENFORCE_TP_SL and not have_tp and TP_REPLACE_IF_MISSED:
-                # рассчитать TP количество (частично/полностью)
-                min_amt = (get_market(symbol).get('limits', {}).get('amount') or {}).get('min')
-                min_cost = (get_market(symbol).get('limits', {}).get('cost') or {}).get('min')
-                remaining = max(0.0, abs(contracts) - tp_covered_qty(symbol, side_long))
-                if TP_AS_PARTIAL:
-                    tp_qty_raw = max(0.0, remaining * TP_PART_FRACTION)
-                else:
-                    tp_qty_raw = remaining
-                if min_amt:
-                    tp_qty_raw = max(tp_qty_raw, float(min_amt))
-                if min_cost:
-                    tp_qty_raw = max(tp_qty_raw, float(min_cost) / max(last, 1e-9))
-                tp_qty = round_amount(symbol, tp_qty_raw)
+            # --- TP1/TP2 ---
+            risk_per_unit_calc = abs(entry - base_sl)
+            if risk_per_unit_calc <= 0:
+                risk_per_unit_calc = max(abs(entry - base_sl), 1e-9)
 
-                o = place_tp_order(symbol, side_long, tp_qty, tp_r, retries=4, sleep_sec=1.0)
+            tp1_price = entry + PARTIAL_TP_R * risk_per_unit_calc if side_long else entry - PARTIAL_TP_R * risk_per_unit_calc
+            tp2_price = entry + SECOND_TP_R  * risk_per_unit_calc if side_long else entry - SECOND_TP_R  * risk_per_unit_calc
+            tp1_r = round_price(symbol, tp1_price)
+            tp2_r = round_price(symbol, tp2_price)
+
+            pos_qty = abs(float(p.get('contracts') or 0.0))
+            tp1_qty_raw = pos_qty * (PARTIAL_TP_PART if PARTIAL_TP_ENABLE else 0.5)
+            tp2_qty_raw = max(pos_qty - tp1_qty_raw, 0.0)
+
+            mkt = get_market(symbol) or {}
+            min_amt = (mkt.get('limits', {}).get('amount') or {}).get('min')
+            min_cost = (mkt.get('limits', {}).get('cost') or {}).get('min')
+            last_px  = last
+
+            def _apply_minimals(qty_raw):
+                q = qty_raw
+                if min_amt:  q = max(q, float(min_amt))
+                if min_cost: q = max(q, float(min_cost)/max(last_px, 1e-9))
+                return round_amount(symbol, q)
+
+            tp1_qty = _apply_minimals(tp1_qty_raw)
+            tp2_qty = _apply_minimals(tp2_qty_raw)
+
+            if PARTIAL_TP_ENABLE and tp1_qty > 0 and not _tp_present_good_enough(symbol, side_long, tp1_r):
+                o = place_tp_order(symbol, side_long, tp1_qty, tp1_r, retries=4, sleep_sec=1.0)
                 if o:
-                    print(f"{symbol}: TP_RENEW -> {tp_qty} @ {tp_r}")
-                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP_RENEW", "symbol": symbol,
-                                     "amount": tp_qty, "price": tp_r, "order_id": o.get('id')})
+                    print(f"{symbol}: TP1_RENEW -> {tp1_qty} @ {tp1_r}")
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP1_RENEW", "symbol": symbol,
+                                     "amount": tp1_qty, "price": tp1_r, "order_id": o.get('id')})
 
-            # Дозавод SL, если его нет
+            if SECOND_TP_ENABLE and tp2_qty > 0 and not _tp_present_good_enough(symbol, side_long, tp2_r):
+                o = place_tp_order(symbol, side_long, tp2_qty, tp2_r, retries=4, sleep_sec=1.0)
+                if o:
+                    print(f"{symbol}: TP2_RENEW -> {tp2_qty} @ {tp2_r}")
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP2_RENEW", "symbol": symbol,
+                                     "amount": tp2_qty, "price": tp2_r, "order_id": o.get('id')})
+
+            # Дозавод SL
             if ENFORCE_TP_SL and not have_sl and SL_REPLACE_IF_MISSED:
                 o = place_sl_order(symbol, side_long, abs(contracts), new_sl_r)
                 if o:
@@ -1475,7 +1672,7 @@ def manage_positions(df_map):
                     ensure_json_log({"ts": now_utc().isoformat(), "event": "SL_RENEW", "symbol": symbol,
                                      "price": new_sl_r, "order_id": o.get('id')})
 
-            # Улучшение SL (двигаем только «в плюс»)
+            # Улучшение SL
             need_move = False
             if sl_current == 0.0:
                 need_move = True
@@ -1563,6 +1760,8 @@ state.update({
     "pump_lock": {},       # symbol -> bars_left
     "sl_orders": {},
     "tp_orders": {},
+    "last_stop_bar": {},       # symbol -> timestamp последнего бара, где был стоп
+    "losses_today_by_symbol": {}  # symbol -> int
 })
 
 def update_pump_lock(symbol, pumped):
@@ -1602,6 +1801,7 @@ def cooldown_ok(symbol, df):
     return False
 
 def main():
+    state["_prev_positions"] = fetch_positions_map()
     print("Бот запущен (swap):", ", ".join(SYMBOLS_TO_TRADE), "| MODE:", MODE)
     tf_sec = timeframe_seconds(TIMEFRAME_ENTRY)
     last_closed_ts = {s: None for s in SYMBOLS_TO_TRADE}
@@ -1624,6 +1824,8 @@ def main():
             except Exception as e:
                 print("Не удалось получить баланс:", e)
                 usdt_balance = None
+
+            prev_pos_map = state.get("_prev_positions", {})
 
             pos_map = fetch_positions_map()
 
@@ -1702,11 +1904,18 @@ def main():
                 pumped = ("Pump alert" in reason)
                 update_pump_lock(symbol, pumped=pumped)
 
+                # дебаунс повторных входов
+                if not debounce_ok(symbol, float(df.iloc[-2]['close']), closed_bar['timestamp']):
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol, "reason": "debounce"})
+                    continue
+                
                 if signal != "HOLD":
                     ok = place_trade(symbol, signal, df, usdt_balance_cached=usdt_balance, positions_map=pos_map, closed_bar=closed_bar)
                     print(f"{symbol}: place_trade -> {ok}")
                     if ok:
                         state['last_trade_bar_ts'][symbol] = closed_bar['timestamp']
+                        state['last_signal_price'][symbol] = float(df.iloc[-2]['close'])
+                        state['last_signal_ts'][symbol] = closed_bar['timestamp']
                         ensure_json_log({
                             "ts": now_utc().isoformat(),
                             "event": "ENTRY_SIGNAL",
@@ -1763,6 +1972,65 @@ def main():
             # --- Ежедневный отчёт ---
             if usdt_balance is not None:
                 report_rollover(usdt_balance)
+
+            # --- Detect closed positions (позиция исчезла с биржи) и отметить убыток, если он был ---
+            try:
+                # Актуальная карта позиций после manage_positions()
+                cur_pos_map = fetch_positions_map()
+            
+                # Список символов, у которых позиция была, а теперь исчезла
+                disappeared = []
+                for sym, pprev in prev_pos_map.items():
+                    prev_contracts = float(pprev.get('contracts') or 0.0)
+                    if abs(prev_contracts) <= 0:
+                        continue
+                    # сейчас позиции нет?
+                    pnow = cur_pos_map.get(sym)
+                    if not pnow or abs(float(pnow.get('contracts') or 0.0)) <= 0:
+                        disappeared.append((sym, pprev))
+            
+                for sym, pprev in disappeared:
+                    side_long = float(pprev.get('contracts') or 0.0) > 0
+                    entry     = float(pprev.get('entryPrice') or 0.0) or float(pprev.get('markPrice') or 0.0)
+                    dfx       = df_for_manage.get(sym)
+                    last_px   = None
+                    if dfx is not None and len(dfx) > 0:
+                        last_px = float(dfx.iloc[-1]['close'])
+            
+                    # Если last_px отсутствует, мягко пропускаем оценку PnL
+                    is_loss = None
+                    if last_px is not None and entry > 0:
+                        # Грубая эвристика: если закрылись «хуже входа» по направлению позиции — считаем минус.
+                        if side_long:
+                            is_loss = last_px < entry
+                        else:
+                            is_loss = last_px > entry
+            
+                    if is_loss:
+                        # вот ТЕ САМЫЕ 2 СТРОКИ: фиксируем стоп-бар и инкрементим счётчик
+                        state["last_stop_bar"][sym] = dfx.iloc[-2]["timestamp"] if (dfx is not None and len(dfx) >= 2) else now_utc()
+                        state["losses_today_by_symbol"][sym] = state["losses_today_by_symbol"].get(sym, 0) + 1
+            
+                        ensure_json_log({
+                            "ts": now_utc().isoformat(),
+                            "event": "LOSS_MARK",
+                            "symbol": sym,
+                            "reason": "closed worse than entry (heuristic)"
+                        })
+                    else:
+                        # Можешь залогировать профит или нейтрально
+                        ensure_json_log({
+                            "ts": now_utc().isoformat(),
+                            "event": "EXIT_MARK",
+                            "symbol": sym,
+                            "reason": "position closed (no loss mark)"
+                        })
+            
+                # Сохраняем снимок текущих позиций как «предыдущие» на следующую итерацию
+                state["_prev_positions"] = cur_pos_map
+            
+            except Exception as e:
+                print("detect-closed-positions warn:", e)
 
             align_to_next_candle(tf_sec)
 
