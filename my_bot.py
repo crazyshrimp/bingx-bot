@@ -62,7 +62,7 @@ UNIVERSE_EXCLUDE = {
 LEVERAGE         = 35     # фиксируем, чтобы не сбивалось на 5х
 RISK_PER_TRADE   = 0.005
 RISK_REWARD      = 1.5
-SL_ATR_MULT      = 2.0
+SL_ATR_MULT      = 3.5
 TP_ATR_MULT      = SL_ATR_MULT * RISK_REWARD
 MAX_NOTIONAL_PCT = 0.01
 FEE_PCT          = 0.0006
@@ -191,6 +191,22 @@ print("[BOT] Торгуемые символы:", ", ".join(SYMBOLS_TO_TRADE))
 # =========================
 #          Х Е Л П Е Р Ы
 # =========================
+def debounce_ok(kind: str, symbol: str, cooldown_sec: float = 2.5) -> bool:
+    """
+    kind: 'TP' | 'SL'
+    Возвращает True, если можно выполнять действие (прошёл cooldown).
+    """
+    try:
+        last = state["debounce_ts"][kind].get(symbol, 0.0)
+    except KeyError:
+        state.setdefault("debounce_ts", {"TP": {}, "SL": {}})
+        last = 0.0
+    now = time.time()
+    if now - last >= cooldown_sec:
+        state["debounce_ts"][kind][symbol] = now
+        return True
+    return False
+
 def is_contract(symbol):
     m = markets.get(symbol)
     return bool(m and m.get('contract'))
@@ -360,6 +376,10 @@ state = {
     "_report_day": None,   # <--- для ротации отчёта по датам
 }
 
+# Дополнительные состояния
+state.setdefault("best_sl", {})              # чтобы SL не откатывался назад
+state.setdefault("debounce_ts", {"TP": {}, "SL": {}})  # анти-спам TP/SL
+
 # =========================
 #      Т А Й М Ф Р Е Й М Ы  /  П А Р А М Е Т Р Ы
 # =========================
@@ -375,8 +395,8 @@ USE_IMPULSE       = CFG["USE_IMPULSE"]
 LOOKBACK_BREAKOUT = CFG["LOOKBACK_BREAKOUT"]
 
 # Управление позицией (BE/Trail и частичные TP)
-BREAKEVEN_AT_R        = 0.8
-TRAIL_AT_R            = 1.2
+BREAKEVEN_AT_R        = 1.0   # было 0.8 → меньше ложных BE
+TRAIL_AT_R            = 1.5   # было 1.2 → трейл позже, когда уже «едем»
 TRAIL_ATR_MULT        = 1.8
 PARTIAL_TP_ENABLE     = True
 PARTIAL_TP_PART       = 0.5
@@ -395,8 +415,8 @@ VOL_LOOKBACK = 30
 VOL_ANOM_MULT = 2.0
 
 # Метод стопа: ATR (как раньше) или SWING (по LH/LL)
-SL_METHOD = "ATR"     # "ATR" или "SWING"
-SWING_LOOKBACK = 5    # число баров для поиска локального минимума/максимума
+SL_METHOD = "SWING"     # "ATR" или "SWING"
+SWING_LOOKBACK = 7      # 5–9 для 5m/15m оптимально
 
 # Funding-фильтры (ставка за 8ч)
 FUNDING_SOFT_ABS = 0.0005    # 0.05% — снизить риск x0.5
@@ -837,8 +857,27 @@ def fetch_open_orders_safe(symbol):
         print(f"{symbol}: fetch_open_orders warn: {e}")
         return []
 
+def tp_covered_qty(symbol, side_long):
+    """Сумма qty уже стоящих reduceOnly TP. Нужно, чтобы не пытаться перекрыть позицию сверх 100%."""
+    try:
+        opens = fetch_open_orders_safe(symbol)
+        covered = 0.0
+        for o in opens:
+            if not o.get('reduceOnly'):
+                continue
+            side = (o.get('side') or '').lower()
+            if side_long and side != 'sell':
+                continue
+            if (not side_long) and side != 'buy':
+                continue
+            q = o.get('amount') or o.get('remaining') or 0
+            covered += float(q or 0)
+        return max(0.0, covered)
+    except Exception:
+        return 0.0
+
 def is_tp_order(o, pos_side_long, tp_price=None):
-    """TP — limit reduceOnly противоположной стороной (цена опциональна для проверки)."""
+    """TP = reduceOnly лимит-противоположной стороны. Цена опциональна: главное — что он есть."""
     try:
         if not o.get('reduceOnly'):
             return False
@@ -850,7 +889,11 @@ def is_tp_order(o, pos_side_long, tp_price=None):
         if tp_price is None:
             return True
         px = o.get('price')
-        return (px is not None) and abs(float(px) - float(tp_price)) <= max(1e-5 * max(abs(float(px)), abs(float(tp_price))), 1e-12)
+        if px is None:
+            return True  # считаем за TP даже без цены, чтобы не переустанавливать лишний раз
+        px = float(px); tgt = float(tp_price)
+        tol = max(1e-5 * max(abs(px), abs(tgt)), 1e-12)
+        return abs(px - tgt) <= tol
     except Exception:
         return False
 
@@ -872,9 +915,9 @@ def is_sl_order(o):
         pass
     return False
 
-def place_tp_order(symbol, pos_side_long, qty, tp_price, retries=3, sleep_sec=0.8):
+def place_tp_order(symbol, pos_side_long, qty, tp_price, retries=4, sleep_sec=0.9):
     """
-    Надёжная постановка reduceOnly лимит-TP. Повторяем при задержках биржи (например, 101290).
+    reduceOnly лимит-TP с повторами (боремся с 101290 и сетевыми задержками).
     """
     side = 'sell' if pos_side_long else 'buy'
     price = round_price(symbol, tp_price)
@@ -1109,31 +1152,73 @@ def place_trade(symbol, signal, df, usdt_balance_cached=None, positions_map=None
         contracts_now = abs(float(pos_info.get('contracts') or 0.0))
         last_exec_px = float(pos_info.get('entryPrice') or last_price)
 
-        # Количество на TP (частично либо 100%)
-        min_amt = (m.get('limits', {}).get('amount') or {}).get('min')
-        min_cost = (m.get('limits', {}).get('cost') or {}).get('min')
-        tp_qty_raw = contracts_now * (TP_PART_FRACTION if TP_AS_PARTIAL else 1.0)
-        if min_amt:
-            tp_qty_raw = max(tp_qty_raw, float(min_amt))
-        if min_cost:
-            tp_qty_raw = max(tp_qty_raw, float(min_cost) / max(last_exec_px, 1e-9))
-        tp_qty = round_amount(symbol, tp_qty_raw)
-
-        # «Подушка» по цене TP (иногда помогает исполнению)
-        tp_price_eff = tp_r
-        if TP_PRICE_PADDING_TICKS:
-            prec = (m.get('precision') or {}).get('price', 8)
-            tick = 10 ** (-prec)
-            tp_price_eff = round_price(symbol, tp_r + (TP_PRICE_PADDING_TICKS * tick if pos_side_long else -TP_PRICE_PADDING_TICKS * tick))
-
-        # Ставим TP
-        tp_ok = place_tp_order(symbol, pos_side_long, tp_qty, tp_price_eff, retries=4, sleep_sec=0.9)
-        if tp_ok:
-            print(f"{symbol}: TP set {tp_qty} @ {tp_price_eff} reduceOnly")
-            ensure_json_log({"ts": now_utc().isoformat(), "event": "TP_ORDER", "symbol": symbol,
-                             "amount": tp_qty, "price": tp_price_eff, "order_id": tp_ok.get('id')})
+        # --- рассчитываем базовый SL от entry, чтобы получить R ---
+        entry_exec = float(pos_info.get('entryPrice') or last_price)
+        base_sl_atr = entry_exec - SL_ATR_MULT * atr_val if pos_side_long else entry_exec + SL_ATR_MULT * atr_val
+        
+        # если включен SWING-стоп — используем его как базовый уровень для расчёта R
+        if SL_METHOD.upper() == "SWING":
+            sw = swing_stop_from(df, side_long=pos_side_long)
+            if sw is not None:
+                base_sl = sw
+            else:
+                base_sl = base_sl_atr
         else:
-            print(f"{symbol}: TP placement deferred — manage_positions дозаведёт")
+            base_sl = base_sl_atr
+        
+        # считаем TP1/TP2 в R-логике
+        tp1_price, tp2_price, tp1_R, tp2_R = compute_tp_prices_and_sizes(entry_exec, base_sl, pos_side_long)
+        if tp1_price is None:
+            print(f"{symbol}: не удалось посчитать TP1/TP2 (risk<=0) — отложим на manage_positions")
+        else:
+            # подушка по шагу цены (опционально)
+            mkt = get_market(symbol) or {}
+            price_prec = (mkt.get('precision') or {}).get('price', 8)
+            def pad(px, is_long):
+                if TP_PRICE_PADDING_TICKS and price_prec is not None:
+                    tick = 10 ** (-price_prec)
+                    return round_price(symbol, px + (TP_PRICE_PADDING_TICKS * tick if is_long else -TP_PRICE_PADDING_TICKS * tick))
+                return round_price(symbol, px)
+        
+            tp1_eff = pad(tp1_price, pos_side_long)
+            tp2_eff = pad(tp2_price, pos_side_long)
+        
+            # считаем количества для двух тейков
+            min_amt = (mkt.get('limits', {}).get('amount') or {}).get('min')
+            min_cost = (mkt.get('limits', {}).get('cost')  or {}).get('min')
+        
+            # распределяем текущий размер позиции на TP1/TP2
+            tp1_qty_raw = abs(contracts_now) * float(TP1_FRACTION)
+            tp2_qty_raw = abs(contracts_now) * float(TP2_FRACTION)
+        
+            def fit_qty(qty_raw, px_ref):
+                q = qty_raw
+                if min_amt:
+                    q = max(q, float(min_amt))
+                if min_cost:
+                    q = max(q, float(min_cost) / max(px_ref, 1e-9))
+                return round_amount(symbol, q)
+        
+            tp1_qty = fit_qty(tp1_qty_raw, tp1_eff)
+            tp2_qty = fit_qty(tp2_qty_raw, tp2_eff)
+        
+            # постanовка TP1
+            tp1_ok = place_tp_order(symbol, pos_side_long, tp1_qty, tp1_eff, retries=4, sleep_sec=0.9)
+            if tp1_ok:
+                print(f"{symbol}: TP1 set {tp1_qty} @ {tp1_eff} ({tp1_R:.2f}R)")
+                ensure_json_log({"ts": now_utc().isoformat(), "event": "TP1_ORDER", "symbol": symbol,
+                                 "amount": tp1_qty, "price": tp1_eff, "R": tp1_R, "order_id": tp1_ok.get('id')})
+            else:
+                print(f"{symbol}: TP1 placement deferred — manage_positions дозаведёт")
+        
+            # постanовка TP2
+            tp2_ok = place_tp_order(symbol, pos_side_long, tp2_qty, tp2_eff, retries=4, sleep_sec=0.9)
+            if tp2_ok:
+                print(f"{symbol}: TP2 set {tp2_qty} @ {tp2_eff} ({tp2_R:.2f}R)")
+                ensure_json_log({"ts": now_utc().isoformat(), "event": "TP2_ORDER", "symbol": symbol,
+                                 "amount": tp2_qty, "price": tp2_eff, "R": tp2_R, "order_id": tp2_ok.get('id')})
+            else:
+                print(f"{symbol}: TP2 placement deferred — manage_positions дозаведёт")
 
         # Ставим SL
         sl_ok = place_sl_order(symbol, pos_side_long, contracts_now, sl_r)
@@ -1231,6 +1316,36 @@ def _tp_present_good_enough(symbol, side_long, tp_target):
     except Exception:
         return False
 
+def get_open_tp_orders(symbol, side_long):
+    """Список текущих reduceOnly лимит-TP ордеров по символу."""
+    out = []
+    try:
+        opens = fetch_open_orders_safe(symbol)
+        for o in opens:
+            if not o.get('reduceOnly'):
+                continue
+            side = (o.get('side') or '').lower()
+            if side_long and side == 'sell':
+                if o.get('type','').lower() in ('limit','limit_maker','take_profit','takeprofit','take_profit_limit'):
+                    out.append(o)
+            if (not side_long) and side == 'buy':
+                if o.get('type','').lower() in ('limit','limit_maker','take_profit','takeprofit','take_profit_limit'):
+                    out.append(o)
+    except Exception:
+        pass
+    return out
+
+def summarize_tp_qty(symbol, side_long):
+    """Суммируем объём, уже забронированный TP ордерами."""
+    tp_orders = get_open_tp_orders(symbol, side_long)
+    s = 0.0
+    for o in tp_orders:
+        try:
+            s += float(o.get('remaining', o.get('amount', 0.0)) or 0.0)
+        except Exception:
+            pass
+    return s, tp_orders
+
 # =========================
 #   У П Р А В Л Е Н И Е  П О З И Ц И Е Й
 # =========================
@@ -1327,7 +1442,11 @@ def manage_positions(df_map):
                 # рассчитать TP количество (частично/полностью)
                 min_amt = (get_market(symbol).get('limits', {}).get('amount') or {}).get('min')
                 min_cost = (get_market(symbol).get('limits', {}).get('cost') or {}).get('min')
-                tp_qty_raw = abs(contracts) * (TP_PART_FRACTION if TP_AS_PARTIAL else 1.0)
+                remaining = max(0.0, abs(contracts) - tp_covered_qty(symbol, side_long))
+                if TP_AS_PARTIAL:
+                    tp_qty_raw = max(0.0, remaining * TP_PART_FRACTION)
+                else:
+                    tp_qty_raw = remaining
                 if min_amt:
                     tp_qty_raw = max(tp_qty_raw, float(min_amt))
                 if min_cost:
