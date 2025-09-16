@@ -69,7 +69,7 @@ FEE_PCT          = 0.0006
 SLIPPAGE_PCT     = 0.0005
 
 # Портфельные лимиты
-MAX_OPEN_POS = 3
+MAX_OPEN_POS = 4
 
 # Кулдаун между входами по одному символу
 TRADE_COOLDOWN_BARS = 3
