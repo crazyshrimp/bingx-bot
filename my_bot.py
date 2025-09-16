@@ -204,10 +204,10 @@ print("[BOT] Торгуемые символы:", ", ".join(SYMBOLS_TO_TRADE))
 # =========================
 #          Х Е Л П Е Р Ы
 # =========================
-def debounce_ok(kind: str, symbol: str, cooldown_sec: float = 2.5) -> bool:
+def debounce_event_ok(kind: str, symbol: str, cooldown_sec: float = 2.5) -> bool:
     """
+    Анти-дребезг для однотипных событий (например, многократных попыток поставить TP/SL).
     kind: 'TP' | 'SL'
-    Возвращает True, если можно выполнять действие (прошёл cooldown).
     """
     try:
         last = state["debounce_ts"][kind].get(symbol, 0.0)
@@ -243,6 +243,22 @@ def round_amount(symbol, amount):
     except Exception:
         return float(amount)
 
+def _lerp(x, x0, x1, y0, y1):
+    if x <= x0: return y0
+    if x >= x1: return y1
+    t = (x - x0) / max(x1 - x0, 1e-9)
+    return y0 + t * (y1 - y0)
+
+def dynamic_sl_mult(atr_pct: float) -> float:
+    """
+    atr_pct = ATR / close
+    При low-vol (atr_pct <= 0.4%) используем SL_ATR_MAX_MULT (шире),
+    при high-vol (atr_pct >= 1.2%) используем SL_ATR_MIN_MULT (уже),
+    между ними — линейная интерполяция.
+    """
+    lo, hi = SL_ATR_PCT_PIVOTS  # (0.004, 0.012)
+    return float(_lerp(atr_pct, lo, hi, SL_ATR_MAX_MULT, SL_ATR_MIN_MULT))
+
 def timeframe_seconds(tf):
     unit = tf[-1]; n = int(tf[:-1])
     if unit == 'm': return n * 60
@@ -256,19 +272,19 @@ def now_utc():
 def utc_hour():
     return now_utc().hour
 
-def debounce_ok(symbol: str, price_now: float, closed_bar_ts, min_pct=0.003, min_bars=2):
+def reentry_debounce_ok(symbol: str, price_now: float, closed_bar_ts, min_pct=0.003, min_bars=2) -> bool:
     """
-    Не даёт перезаходить сразу:
-      - цена должна уйти от прошлой цены сигнала минимум на min_pct (0.3% по умолчанию)
-      - и/или должно пройти не меньше min_bars закрытых баров.
+    Анти-дребезг входов: не даём сразу перезаходить, пока
+    - цена не ушла на min_pct от последней цены сигнала
+    - ИЛИ не прошло минимум min_bars закрытых баров.
     """
     lp = state["last_signal_price"].get(symbol)
     lt = state["last_signal_ts"].get(symbol)
     if lp is None or lt is None:
         return True
     moved_enough = abs(price_now - lp) / max(lp, 1e-9) >= min_pct
+    # closed_bar_ts — это метка времени последнего ЗАКРЫТОГО бара для символа (df.iloc[-2]['timestamp'])
     bars_passed = (closed_bar_ts > lt)
-    # Требуем либо движение, либо «минимум два новых бара» (в твоём цикле по закрытиям это выполнится последовательно)
     return moved_enough or bars_passed
 
 # =========================
@@ -360,33 +376,31 @@ def write_daily_report(prev_day, eq_start, eq_end, events, max_dd):
         print("write_daily_report error:", e)
 
 def report_rollover(usdt_balance):
-    """
-    Пишем отчёт при смене календарного дня.
-    """
-    today = date.fromtimestamp(time.time())
-    # первый вызов — инициализация
-    if state.get("_report_day") is None:
-        state["_report_day"] = today
-        state["last_equity"] = usdt_balance
-        return
+    """Вызывай в конце цикла. Сменился день? — запиши отчёт за прошедший."""
+    try:
+        today = date.fromtimestamp(time.time())
+        prev_day = state.get("day")
+        if prev_day is None:
+            state["day"] = today
+            state["eq_start"] = usdt_balance
+            state["last_equity"] = usdt_balance
+            return
 
-    # если наступил новый день — пишем отчёт за предыдущий
-    if today != state["_report_day"]:
-        prev_day = state["_report_day"]
-        eq_start = state.get("eq_start")
-        eq_end   = state.get("last_equity", usdt_balance)
-        max_dd   = state.get("max_dd", 0.0)
-        try:
-            write_daily_report(prev_day, eq_start, eq_end, state.get("events", []), max_dd)
-        except Exception as e:
-            print("write_daily_report error:", e)
-        # rollover
-        state["_report_day"] = today
-        state["events"] = []
-        state["max_dd"] = 0.0
+        if today != prev_day:
+            eq_start = state.get("eq_start")
+            eq_end   = state.get("last_equity", usdt_balance)
+            events   = state.get("events", [])
+            max_dd   = float(state.get("max_dd", 0.0))
+            write_daily_report(prev_day, eq_start, eq_end, events, max_dd)
 
-    # обновляем последнюю известную equity
-    state["last_equity"] = usdt_balance
+            # обнуляем дневные счётчики
+            state["day"] = today
+            state["eq_start"] = usdt_balance
+            state["events"] = []
+            state["max_dd"] = 0.0
+            state["losses_today_by_symbol"] = {}
+    except Exception as e:
+        print("report_rollover warn:", e)
 
 # =========================
 #        Г Л О Б А Л Ь Н О Е  С О С Т О Я Н И Е
@@ -401,12 +415,15 @@ state = {
     "sl_orders": {},
     "tp_orders": {},
     "events": [],
-    "_report_day": None,   # <--- для ротации отчёта по датам
-    "_prev_positions": {},
-    "last_signal_price": {},      # symbol -> float (последняя цена входа по сигналу)
-    "last_signal_ts": {},         # symbol -> pd.Timestamp (время закрытого бара сигнала)
-    "last_sl_hit_ts": {},         # symbol -> pd.Timestamp (когда выбило по SL)
-
+    # новое / важно для debounce:
+    "debounce_ts": {"TP": {}, "SL": {}},    # для debounce_event_ok
+    "last_signal_ts": {},                   # для reentry_debounce_ok (метка закрытого бара с последним входом)
+    "last_signal_price": {},                # цена последнего входа/сигнала
+    # анти-реэнтри после стопа:
+    "last_stop_bar": {},                    # символ -> timestamp закрытого бара, когда словили SL
+    "losses_today_by_symbol": {},           # символ -> счетчик убыточных попыток за день
+    # лучший (наивысший/наименьший) SL — чтобы не откатывать назад
+    "best_sl": {},                          # символ -> float
 }
 
 # Дополнительные состояния
@@ -1218,20 +1235,22 @@ def place_trade(symbol, signal, df, usdt_balance_cached=None, positions_map=None
             return False
 
     last_price = float(df.iloc[-1]['close'])
-    atr_val = float(df.iloc[-1]['ATR'])
-    sl_mult = dyn_sl_mult(atr_val, last_price)
+    atr_val    = float(df.iloc[-1]['ATR'])
+    atr_pct    = atr_val / max(last_price, 1e-9)
     
-    # --- SL/TP базовые ---
+    # динамический множитель SL
+    sl_mult_eff = dynamic_sl_mult(atr_pct)
+    
     if SL_METHOD.upper() == "SWING":
         sw = swing_stop_from(df, side_long=(signal == 'LONG'))
         if sw is None:
-            sl = (last_price - sl_mult * atr_val) if signal == 'LONG' else (last_price + sl_mult * atr_val)
+            sl = (last_price - sl_mult_eff * atr_val) if signal == 'LONG' else (last_price + sl_mult_eff * atr_val)
         else:
             sl = sw
     else:
-        sl = (last_price - sl_mult * atr_val) if signal == 'LONG' else (last_price + sl_mult * atr_val)
-
-    tp = (last_price + TP_ATR_MULT * atr_val) if signal == 'LONG' else (last_price - TP_ATR_MULT * atr_val)
+        sl = (last_price - sl_mult_eff * atr_val) if signal == 'LONG' else (last_price + sl_mult_eff * atr_val)
+    
+    tp = (last_price + (sl_mult_eff * RISK_REWARD) * atr_val) if signal == 'LONG' else (last_price - (sl_mult_eff * RISK_REWARD) * atr_val)
     side = 'buy' if signal == 'LONG' else 'sell'
     ro_side = 'sell' if signal == 'LONG' else 'buy'
 
@@ -1616,8 +1635,16 @@ def manage_positions(df_map):
                     new_sl_r = max(new_sl_r, best)
                 else:
                     new_sl_r = min(new_sl_r, best)
-            state["best_sl"][symbol] = new_sl_r
 
+            # обнови best
+            if best is None:
+                state["best_sl"][symbol] = new_sl_r
+            else:
+                if side_long and new_sl_r > best:
+                    state["best_sl"][symbol] = new_sl_r
+                if (not side_long) and new_sl_r < best:
+                    state["best_sl"][symbol] = new_sl_r
+            
             # Проверка ордеров
             opens = fetch_open_orders_safe(symbol)
             have_sl = any(is_sl_order(o) for o in opens)
@@ -1898,6 +1925,22 @@ def main():
                     ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol, "reason": "cooldown"})
                     continue
 
+                # анти-реэнтри после свежего стопа/убытка
+                ls = state["last_stop_bar"].get(symbol)
+                if ls is not None:
+                    # требуем минимум REENTRY_LOCK_BARS_AFTER_STOP закрытых баров тишины
+                    bars_since_stop = df[df['timestamp'] > ls]
+                    if len(bars_since_stop) < REENTRY_LOCK_BARS_AFTER_STOP:
+                        ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol,
+                                         "reason": f"post-stop lock: {len(bars_since_stop)}/{REENTRY_LOCK_BARS_AFTER_STOP}"})
+                        continue
+                
+                # лимит убыточных попыток по символу на день
+                if state["losses_today_by_symbol"].get(symbol, 0) >= MAX_LOSSES_PER_SYMBOL_PER_DAY:
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol,
+                                     "reason": "max losses for symbol reached"})
+                    continue
+
                 signal, reason = generate_signal(df, d_htf, symbol, regime)
                 print(f">>> {symbol} | Сигнал: {signal} | Причина: {reason}")
 
@@ -1905,8 +1948,9 @@ def main():
                 update_pump_lock(symbol, pumped=pumped)
 
                 # дебаунс повторных входов
-                if not debounce_ok(symbol, float(df.iloc[-2]['close']), closed_bar['timestamp']):
-                    ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol, "reason": "debounce"})
+                if not reentry_debounce_ok(symbol, float(df.iloc[-1]['close']), closed_bar['timestamp'], min_pct=0.003, min_bars=2):
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "HOLD", "symbol": symbol,
+                                     "reason": "reentry_debounce"})
                     continue
                 
                 if signal != "HOLD":
