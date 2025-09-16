@@ -404,7 +404,10 @@ BREAKEVEN_AT_R        = 1.0   # было 0.8 → меньше ложных BE
 TRAIL_AT_R            = 1.5   # было 1.2 → трейл позже, когда уже «едем»
 TRAIL_ATR_MULT        = 1.8
 PARTIAL_TP_ENABLE     = True
+PARTIAL_TP_R          = 0.8   # частичный TP на 0.8R
 PARTIAL_TP_PART       = 0.5
+SECOND_TP_ENABLE      = True
+SECOND_TP_R           = 1.8   # финальный TP на 1.8R
 TP_AS_PARTIAL         = True
 TP_PART_FRACTION      = PARTIAL_TP_PART if PARTIAL_TP_ENABLE else 1.0
 
