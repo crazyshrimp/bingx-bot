@@ -19,7 +19,7 @@ MODE = "LIVE"  # "TEST" (скальпинг) или "LIVE" (боевой)
 PRESETS = {
     "LIVE": {
         "TIMEFRAME_ENTRY": "5m",
-        "TIMEFRAME_HTF": "1h",
+        "TIMEFRAME_HTF": "4h",
         "AVOID_HOURS_UTC": set(range(0, 6)),  # ночью не торгуем
         "MAX_DAILY_DD": 0.05,                 # дневной стоп 5%
         "MAX_ATR_PCT": 0.03,                  # ограничение на волатильность
@@ -73,6 +73,11 @@ MAX_OPEN_POS = 4
 
 # Кулдаун между входами по одному символу
 TRADE_COOLDOWN_BARS = 3
+
+# Быстрый менеджмент открытых позиций (независимо от закрытия свечи)
+MANAGE_FAST_LOOP    = True     # включить быстрые проверки
+MANAGE_EVERY_SEC    = 20       # как часто дергать manage_positions, сек
+MANAGE_TF_FOR_OPEN  = "1m"     # ТФ, на котором обновляем индикаторы для уже открытых позиций
 
 # =========================
 #      И Н И Ц И А Л И З А Ц И Я
@@ -1497,14 +1502,56 @@ def manage_positions(df_map):
         except Exception as e:
             print(f"{symbol}: manage_positions item warn: {e}")
 
+def manage_fast_tick():
+    """
+    Быстрый тик сопровождения: подтягиваем данные ТОЛЬКО по тем символам, где уже есть позиция,
+    пересчитываем индикаторы на MANAGE_TF_FOR_OPEN и зовём manage_positions(df_map).
+    """
+    if not MANAGE_FAST_LOOP:
+        return
+    try:
+        positions = fetch_positions_map()
+        if not positions:
+            return
+        symbols_open = [sym for sym, p in positions.items() if abs(float(p.get('contracts') or 0.0)) > 0]
+        if not symbols_open:
+            return
+
+        df_map = {}
+        for symbol in symbols_open:
+            df_raw = fetch_ohlcv(symbol, MANAGE_TF_FOR_OPEN, limit=200)
+            if df_raw.empty:
+                continue
+            df = add_indicators(df_raw)
+            if df.empty:
+                continue
+            df_map[symbol] = df
+
+        if df_map:
+            manage_positions(df_map)
+    except Exception as e:
+        print("manage_fast_tick warn:", e)
+
+
 # =========================
 #         М А И Н
 # =========================
 def align_to_next_candle(tf_seconds):
+    """
+    Ждём до закрытия следующей свечи, но каждые MANAGE_EVERY_SEC выполняем manage_fast_tick().
+    """
     now = int(time.time())
     wait = tf_seconds - (now % tf_seconds) + 2
-    print(f"\nЖдём до закрытия следующей свечи: ~{wait}s")
-    time.sleep(wait)
+    print(f"\nЖдём до закрытия следующей свечи: ~{wait}s (fast-manage каждые {MANAGE_EVERY_SEC}s)")
+    t0 = time.time()
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= wait:
+            break
+        if MANAGE_FAST_LOOP and (int(elapsed) % max(1, MANAGE_EVERY_SEC) == 0):
+            manage_fast_tick()
+            time.sleep(1.0)  # защита от двойного вызова в ту же секунду
+        time.sleep(0.5)
 
 state.update({
     "day": None,
