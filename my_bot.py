@@ -375,32 +375,42 @@ def write_daily_report(prev_day, eq_start, eq_end, events, max_dd):
     except Exception as e:
         print("write_daily_report error:", e)
 
-def report_rollover(usdt_balance):
-    """Вызывай в конце цикла. Сменился день? — запиши отчёт за прошедший."""
-    try:
-        today = date.fromtimestamp(time.time())
-        prev_day = state.get("day")
-        if prev_day is None:
-            state["day"] = today
-            state["eq_start"] = usdt_balance
-            state["last_equity"] = usdt_balance
-            return
+def report_rollover(current_equity: float):
+    """
+    Если день сменился — пишет отчёт за предыдущий день.
+    Обновляет eq_start на новый день.
+    """
+    today = date.fromtimestamp(time.time())
+    if state.get("day") is None:
+        state["day"] = today
+        state["eq_start"] = current_equity
+        state["last_equity"] = current_equity
+        state["max_dd"] = 0.0
+        state["events"] = state.get("events", [])
+        return
 
-        if today != prev_day:
-            eq_start = state.get("eq_start")
-            eq_end   = state.get("last_equity", usdt_balance)
-            events   = state.get("events", [])
-            max_dd   = float(state.get("max_dd", 0.0))
-            write_daily_report(prev_day, eq_start, eq_end, events, max_dd)
+    if state["day"] != today:
+        # закрываем вчера
+        prev_day = state["day"]
+        eq_start = state.get("eq_start")
+        eq_end   = state.get("last_equity", current_equity)
+        events   = state.get("events", [])
+        max_dd   = state.get("max_dd", 0.0)
+        write_daily_report(prev_day, eq_start, eq_end, events, max_dd)
 
-            # обнуляем дневные счётчики
-            state["day"] = today
-            state["eq_start"] = usdt_balance
-            state["events"] = []
-            state["max_dd"] = 0.0
-            state["losses_today_by_symbol"] = {}
-    except Exception as e:
-        print("report_rollover warn:", e)
+        # открываем новый день
+        state["day"] = today
+        state["eq_start"] = current_equity
+        state["last_equity"] = current_equity
+        state["max_dd"] = 0.0
+        state["events"] = []
+    else:
+        # в течение дня обновляем последнее equity и max DD
+        state["last_equity"] = current_equity
+        if state.get("eq_start"):
+            dd = (state["eq_start"] - current_equity) / max(state["eq_start"], 1e-9)
+            if dd > state.get("max_dd", 0.0):
+                state["max_dd"] = dd
 
 # =========================
 #        Г Л О Б А Л Ь Н О Е  С О С Т О Я Н И Е
@@ -1569,8 +1579,8 @@ def manage_positions(df_map):
     Контроль открытых позиций:
       - Перевод SL в BE при R >= BREAKEVEN_AT_R
       - Трейл SL при R >= TRAIL_AT_R
-      - Никогда не двигаем SL назад (только в плюс)
-      - Два TP (частичный TP1 и финальный TP2)
+      - Никогда не двигаем SL назад (только в плюс) — через state["best_sl"]
+      - Две цели: TP1 (частичный) и TP2 (финальный)
       - Обеспечиваем наличие TP/SL; дозаводим если их нет
     """
     if DRY_RUN:
@@ -1595,31 +1605,37 @@ def manage_positions(df_map):
             last  = float(m.iloc[-1]['close'])
             atr   = float(m.iloc[-1]['ATR'])
 
-            # Базовые уровни
-            base_tp = entry + TP_ATR_MULT * atr if side_long else entry - TP_ATR_MULT * atr
+            # базовые уровни по модели
+            # R-единица риска: от entry до «базового» SL (ATR)
             base_sl_atr = entry - SL_ATR_MULT * atr if side_long else entry + SL_ATR_MULT * atr
+            risk_per_unit = abs(entry - base_sl_atr)
+            if risk_per_unit <= 0:
+                risk_per_unit = max(abs(entry - (entry - 0.01 if side_long else entry + 0.01)), 1e-9)
+
+            # цели в «цене» из R
+            tp1_price = entry + PARTIAL_TP_R * risk_per_unit if side_long else entry - PARTIAL_TP_R * risk_per_unit
+            tp2_price = entry + SECOND_TP_R  * risk_per_unit if side_long else entry - SECOND_TP_R  * risk_per_unit
+
+            # SL — ATR/SWING
             if SL_METHOD.upper() == "SWING":
                 sw = swing_stop_from(m, side_long=side_long)
                 base_sl = sw if (sw is not None) else base_sl_atr
             else:
                 base_sl = base_sl_atr
 
-            # Текущий SL
+            # текущий SL с биржи (если есть)
             sl_current = float(p.get('stopLossPrice') or 0.0)
             effective_sl_for_r = sl_current if sl_current != 0 else base_sl
 
-            # R-текущее
-            risk_per_unit = abs(entry - effective_sl_for_r)
-            if risk_per_unit <= 0:
-                risk_per_unit = max(abs(entry - base_sl), 1e-9)
+            # текущий R
             upnl_per_unit = (last - entry) if side_long else (entry - last)
-            R_now = upnl_per_unit / risk_per_unit
+            R_now = upnl_per_unit / max(abs(entry - effective_sl_for_r), 1e-9)
 
-            # Новый SL (BE / Trail)
+            # кандидат на новый SL (BE и/или трейл)
             new_sl = base_sl
-            if R_now >= BREAKEVEN_AT_R:      # BE
+            if R_now >= BREAKEVEN_AT_R:
                 new_sl = entry
-            if R_now >= TRAIL_AT_R:          # трейл
+            if R_now >= TRAIL_AT_R:
                 trail_sl = (last - TRAIL_ATR_MULT * atr) if side_long else (last + TRAIL_ATR_MULT * atr)
                 if side_long:
                     new_sl = max(new_sl, trail_sl)
@@ -1627,6 +1643,8 @@ def manage_positions(df_map):
                     new_sl = min(new_sl, trail_sl)
 
             new_sl_r = round_price(symbol, new_sl)
+            tp1_r    = round_price(symbol, tp1_price)
+            tp2_r    = round_price(symbol, tp2_price)
 
             # Никогда не откатываем SL назад
             best = state["best_sl"].get(symbol)
@@ -1635,8 +1653,7 @@ def manage_positions(df_map):
                     new_sl_r = max(new_sl_r, best)
                 else:
                     new_sl_r = min(new_sl_r, best)
-
-            # обнови best
+            # сохранить «лучший» SL
             if best is None:
                 state["best_sl"][symbol] = new_sl_r
             else:
@@ -1644,54 +1661,17 @@ def manage_positions(df_map):
                     state["best_sl"][symbol] = new_sl_r
                 if (not side_long) and new_sl_r < best:
                     state["best_sl"][symbol] = new_sl_r
-            
-            # Проверка ордеров
+
+            # Проверка открытых ордеров
             opens = fetch_open_orders_safe(symbol)
             have_sl = any(is_sl_order(o) for o in opens)
+            have_tp1 = _tp_present_good_enough(symbol, side_long, tp1_r)
+            have_tp2 = _tp_present_good_enough(symbol, side_long, tp2_r)
 
-            # --- TP1/TP2 ---
-            risk_per_unit_calc = abs(entry - base_sl)
-            if risk_per_unit_calc <= 0:
-                risk_per_unit_calc = max(abs(entry - base_sl), 1e-9)
+            # Если TP1 уже исполнился (проверяем маркер в state), то дозаводим только TP2
+            tp1_done = state["tp1_filled"].get(symbol, False)
 
-            tp1_price = entry + PARTIAL_TP_R * risk_per_unit_calc if side_long else entry - PARTIAL_TP_R * risk_per_unit_calc
-            tp2_price = entry + SECOND_TP_R  * risk_per_unit_calc if side_long else entry - SECOND_TP_R  * risk_per_unit_calc
-            tp1_r = round_price(symbol, tp1_price)
-            tp2_r = round_price(symbol, tp2_price)
-
-            pos_qty = abs(float(p.get('contracts') or 0.0))
-            tp1_qty_raw = pos_qty * (PARTIAL_TP_PART if PARTIAL_TP_ENABLE else 0.5)
-            tp2_qty_raw = max(pos_qty - tp1_qty_raw, 0.0)
-
-            mkt = get_market(symbol) or {}
-            min_amt = (mkt.get('limits', {}).get('amount') or {}).get('min')
-            min_cost = (mkt.get('limits', {}).get('cost') or {}).get('min')
-            last_px  = last
-
-            def _apply_minimals(qty_raw):
-                q = qty_raw
-                if min_amt:  q = max(q, float(min_amt))
-                if min_cost: q = max(q, float(min_cost)/max(last_px, 1e-9))
-                return round_amount(symbol, q)
-
-            tp1_qty = _apply_minimals(tp1_qty_raw)
-            tp2_qty = _apply_minimals(tp2_qty_raw)
-
-            if PARTIAL_TP_ENABLE and tp1_qty > 0 and not _tp_present_good_enough(symbol, side_long, tp1_r):
-                o = place_tp_order(symbol, side_long, tp1_qty, tp1_r, retries=4, sleep_sec=1.0)
-                if o:
-                    print(f"{symbol}: TP1_RENEW -> {tp1_qty} @ {tp1_r}")
-                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP1_RENEW", "symbol": symbol,
-                                     "amount": tp1_qty, "price": tp1_r, "order_id": o.get('id')})
-
-            if SECOND_TP_ENABLE and tp2_qty > 0 and not _tp_present_good_enough(symbol, side_long, tp2_r):
-                o = place_tp_order(symbol, side_long, tp2_qty, tp2_r, retries=4, sleep_sec=1.0)
-                if o:
-                    print(f"{symbol}: TP2_RENEW -> {tp2_qty} @ {tp2_r}")
-                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP2_RENEW", "symbol": symbol,
-                                     "amount": tp2_qty, "price": tp2_r, "order_id": o.get('id')})
-
-            # Дозавод SL
+            # Дозавод SL, если его нет
             if ENFORCE_TP_SL and not have_sl and SL_REPLACE_IF_MISSED:
                 o = place_sl_order(symbol, side_long, abs(contracts), new_sl_r)
                 if o:
@@ -1699,7 +1679,7 @@ def manage_positions(df_map):
                     ensure_json_log({"ts": now_utc().isoformat(), "event": "SL_RENEW", "symbol": symbol,
                                      "price": new_sl_r, "order_id": o.get('id')})
 
-            # Улучшение SL
+            # Улучшаем SL (только «в плюс»)
             need_move = False
             if sl_current == 0.0:
                 need_move = True
@@ -1708,7 +1688,6 @@ def manage_positions(df_map):
                     need_move = True
                 if (not side_long) and new_sl_r < sl_current - 1e-12:
                     need_move = True
-
             if need_move:
                 try:
                     replace_sl_order(symbol, side_long, abs(contracts), new_sl_r)
@@ -1725,6 +1704,51 @@ def manage_positions(df_map):
                     })
                 except Exception as e:
                     print(f"{symbol}: manage SL warn: {e}")
+
+            # --- Дозавод TP1/TP2 ---
+            # Размер на TP1 и TP2
+            # Если TP1 ещё не исполнился: TP1 — PARTIAL_TP_PART * pos, TP2 — (1 - PARTIAL_TP_PART) * pos
+            # Если TP1 уже исполнился: TP2 — всё, что осталось
+            q_total = abs(contracts)
+            q_tp1_raw = q_total * PARTIAL_TP_PART if (PARTIAL_TP_ENABLE and not tp1_done) else 0.0
+            q_tp2_raw = q_total - q_tp1_raw if SECOND_TP_ENABLE else 0.0
+
+            # Учёт минимальных ограничений
+            mkt = get_market(symbol) or {}
+            min_amt = (mkt.get('limits', {}).get('amount') or {}).get('min')
+            min_cost = (mkt.get('limits', {}).get('cost')  or {}).get('min')
+            px_for_cost = max(last, 1e-9)
+
+            def _fit_qty(q):
+                qx = q
+                if min_amt:  qx = max(qx, float(min_amt))
+                if min_cost: qx = max(qx, float(min_cost) / px_for_cost)
+                return round_amount(symbol, qx)
+
+            q_tp1 = _fit_qty(q_tp1_raw) if q_tp1_raw > 0 else 0.0
+            q_tp2 = _fit_qty(q_tp2_raw) if q_tp2_raw > 0 else 0.0
+
+            # Ставим TP1, если он нужен и его нет
+            if PARTIAL_TP_ENABLE and not tp1_done and not have_tp1 and q_tp1 > 0:
+                o1 = place_tp_order(symbol, side_long, q_tp1, tp1_r, retries=4, sleep_sec=1.0)
+                if o1:
+                    print(f"{symbol}: TP1_RENEW -> {q_tp1} @ {tp1_r}")
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP1_RENEW", "symbol": symbol,
+                                     "amount": q_tp1, "price": tp1_r, "order_id": o1.get('id')})
+
+            # Ставим TP2, если он нужен и его нет
+            if SECOND_TP_ENABLE and not have_tp2 and q_tp2 > 0:
+                o2 = place_tp_order(symbol, side_long, q_tp2, tp2_r, retries=4, sleep_sec=1.0)
+                if o2:
+                    print(f"{symbol}: TP2_RENEW -> {q_tp2} @ {tp2_r}")
+                    ensure_json_log({"ts": now_utc().isoformat(), "event": "TP2_RENEW", "symbol": symbol,
+                                     "amount": q_tp2, "price": tp2_r, "order_id": o2.get('id')})
+
+            # Маркировать слив/стоп (для анти-реэнтри) — если SL уехал «в плюс» и позиция закрылась, это ловится в другом месте,
+            # но если биржа выдаёт статус/PNL — можно интегрировать тут. Минимально отметим, когда SL был «ниже» и R_now < 0.
+            if R_now < -0.05:
+                state["last_stop_bar"][symbol] = m.iloc[-2]["timestamp"]
+                state["losses_today_by_symbol"][symbol] = state["losses_today_by_symbol"].get(symbol, 0) + 1
 
         except Exception as e:
             print(f"{symbol}: manage_positions item warn: {e}")
@@ -1789,6 +1813,9 @@ state.update({
     "tp_orders": {},
     "last_stop_bar": {},       # symbol -> timestamp последнего бара, где был стоп
     "losses_today_by_symbol": {}  # symbol -> int
+    "best_sl": {},                   # symbol -> «лучший» SL (никогда не откатываем назад)
+    "tp1_filled": {},                # symbol -> bool, был ли частичный TP (TP1)
+    "events": state.get("events", []),
 })
 
 def update_pump_lock(symbol, pumped):
@@ -2013,9 +2040,11 @@ def main():
 
             manage_positions(df_for_manage)
 
-            # --- Ежедневный отчёт ---
-            if usdt_balance is not None:
+            # Ежедневный отчёт (внутри сам проверяет смену дня)
+            try:
                 report_rollover(usdt_balance)
+            except Exception as e:
+                print("daily_report warn:", e)
 
             # --- Detect closed positions (позиция исчезла с биржи) и отметить убыток, если он был ---
             try:
