@@ -1583,6 +1583,14 @@ def manage_positions(df_map):
       - Две цели: TP1 (частичный) и TP2 (финальный)
       - Обеспечиваем наличие TP/SL; дозаводим если их нет
     """
+
+    # локальные копии настроек TP
+    partial_tp_enable = bool(globals().get('PARTIAL_TP_ENABLE', True))
+    partial_tp_r      = float(globals().get('PARTIAL_TP_R', 0.8))     # 0.8R
+    partial_tp_part   = float(globals().get('PARTIAL_TP_PART', 0.5))  # 50% позиции
+    second_tp_enable  = bool(globals().get('SECOND_TP_ENABLE', True))
+    second_tp_r       = float(globals().get('SECOND_TP_R', 1.8))      # 1.8R
+    
     if DRY_RUN:
         return
 
@@ -1812,7 +1820,7 @@ state.update({
     "sl_orders": {},
     "tp_orders": {},
     "last_stop_bar": {},       # symbol -> timestamp последнего бара, где был стоп
-    "losses_today_by_symbol": {}  # symbol -> int
+    "losses_today_by_symbol": {},  # symbol -> int
     "best_sl": {},                   # symbol -> «лучший» SL (никогда не откатываем назад)
     "tp1_filled": {},                # symbol -> bool, был ли частичный TP (TP1)
     "events": state.get("events", []),
