@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Patched BingX bot (compact), focused on robust TP/SL handling incl. SHORT side,
+reduceOnly retries, never-regress SL, and 5m/4h framework.
+Designed as a drop-in alternative if you want a slimmer core that 'just works'.
+"""
+
+import os, time, math, json
+from datetime import datetime, timezone, date
+import ccxt
+import pandas as pd
+import numpy as np
+import random
+import string
+
+# ------------------------- Config & Presets -------------------------
+MODE = os.getenv("BOT_MODE", "LIVE").upper()  # LIVE | TEST
+
+# Базовые пресеты, от них пляшем (ENV может переопределить)
+PRESETS = {
+    "LIVE": {
+        "ENTRY_TF": "5m",
+        "HTF_TF": "4h",
+        "AVOID_HOURS_UTC": set(range(0, 6)),  # пауза по ночам (UTC)
+        "DRY_RUN": False,
+    },
+    "TEST": {
+        "ENTRY_TF": "5m",
+        "HTF_TF": "1h",
+        "AVOID_HOURS_UTC": set(),             # 24/7
+        "DRY_RUN": True,
+    },
+}
+
+# Активный пресет
+CFG = PRESETS.get(MODE, PRESETS["LIVE"])
+
+# Флаг "сухого" режима берём из активного пресета (до ENV)
+DRY_RUN = bool(CFG.get("DRY_RUN", False))
+
+# Таймфреймы и торговые окна (ENV имеет приоритет над пресетом)
+TIMEFRAME_ENTRY = os.getenv("ENTRY_TF", CFG["ENTRY_TF"])
+TIMEFRAME_HTF   = os.getenv("HTF_TF",   CFG["HTF_TF"])
+AVOID_HOURS_UTC = CFG["AVOID_HOURS_UTC"]
+
+# Ключи API
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+if not BINGX_API_KEY or not BINGX_SECRET_KEY:
+    raise RuntimeError("Missing BINGX_API_KEY/BINGX_SECRET_KEY")
+
+# Риск и лимиты (ENV может переопределить)
+LEVERAGE         = int(os.getenv("BOT_LEVERAGE", "35"))
+RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.005"))
+FEE_PCT          = 0.0006
+SLIPPAGE_PCT     = 0.0005
+MAX_NOTIONAL_PCT = 0.01
+MAX_DAILY_DD     = 0.05
+MAX_ATR_PCT      = 0.04
+
+# TP/SL & trailing
+SL_ATR_MULT      = 2.0
+TP_ATR_MULT      = 3.0
+BREAKEVEN_AT_R   = 0.8
+TRAIL_AT_R       = 1.2
+TRAIL_ATR_MULT   = 1.8
+
+# --- Управление только своими ордерами ---
+BOT_CID_PREFIX = "mybot_"   # префикс clientOrderId всех бот-ордеров
+ALLOW_MANAGE_FOREIGN = False  # False: не управляем позициями, которых бот не открывал
+
+# Partial / dual take profits (будут игнорироваться при SINGLE_TP_MODE=True)
+PARTIAL_TP_ENABLE = True
+PARTIAL_TP_PART   = 0.5
+SECOND_TP_ENABLE  = True
+SECOND_TP_R       = 1.8
+
+# === Single-TP режим: закрываем ВСЮ позицию по TP1, SL не двигаем ===
+SINGLE_TP_MODE      = True        # включить режим "один тейк"
+FULL_TP_R           = 1.0         # TP1 на +1.0R (можно 0.8–1.2)
+MOVE_SL_DYNAMIC     = False       # не трогать SL после входа
+
+# Допуски/подушки для безопасной постановки ордеров
+TP_PRICE_TOL_PCT    = 0.0005      # 5 б.п. – «не хуже»
+TP_PRICE_PADDING_TICKS = 0        # 0 — без подушки
+
+# Funding guard
+FUNDING_SOFT_ABS = 0.0005
+FUNDING_HARD_ABS = 0.0010
+FUNDING_NO_OPEN_WINDOW_SEC = 3600
+
+# ------------------------- Universe -------------------------
+# Статический список + фильтр на плечевые токены/инверсии (3L/3S/5L/5S/UP/DOWN)
+_SYMBOLS_STATIC_RAW = [
+    'BTC/USDT:USDT','ETH/USDT:USDT','BNB/USDT:USDT','SOL/USDT:USDT','XRP/USDT:USDT',
+    'LINK/USDT:USDT','DOGE/USDT:USDT','AVAX/USDT:USDT','LTC/USDT:USDT','ADA/USDT:USDT',
+    'HYPE/USDT:USDT','POL/USDT:USDT','APT/USDT:USDT','OP/USDT:USDT','INJ/USDT:USDT',
+    'ARB/USDT:USDT','NEAR/USDT:USDT','FLOKI/USDT:USDT',
+]
+
+def _is_plain_perp(sym: str) -> bool:
+    base = sym.split('/')[0].upper()
+    # Режем все токены с левериджем/инверсией в имени
+    bad_fragments = ("3L","3S","5L","5S","UP","DOWN")
+    return not any(frag in base for frag in bad_fragments)
+
+SYMBOLS_TO_TRADE = [s for s in _SYMBOLS_STATIC_RAW if _is_plain_perp(s)]
+
+# ------------------------- Logging -------------------------
+USER = os.getenv("USER","ubuntu")
+LOG_FILE     = f"/home/{USER}/crypto-bot/trades_log.jsonl"
+PRINT_PREFIX = "[BOT]"
+
+# ------------------------- Exchange -------------------------
+exchange = ccxt.bingx({
+    "apiKey": BINGX_API_KEY,
+    "secret": BINGX_SECRET_KEY,
+    "options": {"defaultType": "swap"},
+    "enableRateLimit": True,
+})
+markets = exchange.load_markets(reload=True)
+
+# ------------------------- Helpers -------------------------
+def now_utc(): return datetime.now(timezone.utc)
+def round_price(symbol, price):
+    try: return float(exchange.price_to_precision(symbol, price))
+    except: return float(price)
+def round_amount(symbol, amount):
+    try: return float(exchange.amount_to_precision(symbol, amount))
+    except: return float(amount)
+def timeframe_seconds(tf):
+    n, u = int(tf[:-1]), tf[-1]
+    return n*60 if u=='m' else n*3600 if u=='h' else n*86400
+
+def _rnd_token(n=6):
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+def make_cid(tag: str = "ord") -> str:
+    # clientOrderId: <prefix><tag>_<timestamp>_<rand>
+    return f"{BOT_CID_PREFIX}{tag}_{int(time.time()*1000)}_{_rnd_token()}"
+
+def ensure_json_log(d):
+    try:
+        with open(LOG_FILE,"a",encoding="utf-8") as f:
+            f.write(json.dumps({**d,"ts":d.get("ts") or now_utc().isoformat()}, ensure_ascii=False)+"\n")
+    except Exception as e:
+        print("LOG write error:",e)
+
+def fetch_ohlcv(symbol, tf, limit=250):
+    try:
+        data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+        df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        return df
+    except Exception as e:
+        print(f"{symbol}: fetch_ohlcv err:",e); return pd.DataFrame()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    up = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    dn = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up/dn.replace(0,np.nan)
+    return 100 - (100/(1+rs))
+
+def macd(series, fast=12, slow=26, signal=9):
+    ef = series.ewm(span=fast, adjust=False).mean()
+    es = series.ewm(span=slow, adjust=False).mean()
+    line = ef-es
+    sig  = line.ewm(span=signal, adjust=False).mean()
+    hist = line-sig
+    return line, sig, hist
+
+def atr(df, period=14):
+    hl = df['high'] - df['low']
+    hc = (df['high'] - df['close'].shift()).abs()
+    lc = (df['low']  - df['close'].shift()).abs()
+    tr = pd.concat([hl,hc,lc],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def add_indicators(df):
+    if df.empty or len(df) < 60: return pd.DataFrame()
+    d = df.copy()
+    d["RSI"] = rsi(d["close"],14)
+    mac, sig, hist = macd(d["close"])
+    d["MACD"], d["MACD_sig"], d["MACD_hist"] = mac, sig, hist
+    d["ATR"] = atr(d,14)
+    d["EMA20"] = d["close"].ewm(span=20, adjust=False).mean()
+    d["EMA50"] = d["close"].ewm(span=50, adjust=False).mean()
+    d["EMA200"] = d["close"].ewm(span=200, adjust=False).mean()
+    d.dropna(inplace=True)
+    return d
+
+    def _sum_reduce_only_qty(opens, close_side: str) -> float:
+    """
+    Считает суммарный qty всех reduceOnly ордеров на стороне закрытия позиции.
+    close_side: 'buy' (закрывает SHORT) или 'sell' (закрывает LONG)
+    """
+    total = 0.0
+    for o in opens or []:
+        if not o.get('reduceOnly'):
+            continue
+        side = (o.get('side') or '').lower()
+        if side != close_side:
+            continue
+        try:
+            total += float(o.get('amount') or o.get('remaining') or 0.0)
+        except Exception:
+            continue
+    return total
+
+def _price_tick(symbol: str) -> float:
+    m = get_market(symbol) or {}
+    prec = (m.get('precision') or {}).get('price', 8)
+    try:
+        return 10 ** (-int(prec))
+    except Exception:
+        return 1e-8
+
+def cancel_reduce_only(symbol):
+    """Отменяет все reduceOnly ордера по символу (борьба с 101290)."""
+    try:
+        opens = fetch_open_orders_safe(symbol)
+        for o in opens:
+            if o.get('reduceOnly'):
+                try:
+                    exchange.cancel_order(o['id'], symbol)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"{symbol}: cancel_reduce_only warn: {e}")
+
+def _rnd_token(n=6):
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+def make_cid(tag: str = "ord") -> str:
+    # clientOrderId: <prefix><tag>_<timestamp>_<rand>
+    return f"{BOT_CID_PREFIX}{tag}_{int(time.time()*1000)}_{_rnd_token()}"
+
+def _sum_reduce_only_qty_bot(open_orders, close_side: str) -> float:
+    """
+    Сумма количеств уже висящих reduceOnly-ордеров именно от бота (по нашему clientOrderId),
+    которые закрывают позицию close_side ('sell' для LONG, 'buy' для SHORT).
+    """
+    tot = 0.0
+    for o in open_orders:
+        try:
+            if not o.get('reduceOnly'):
+                continue
+            side = (o.get('side') or '').lower()
+            if side != close_side:
+                continue
+            # считаем только наши ордера
+            if not _is_bot_order(o):
+                continue
+            amt = float(o.get('amount') or 0.0)
+            if amt > 0:
+                tot += amt
+        except Exception:
+            continue
+    return tot
+
+# ------------------------- State -------------------------
+state = {
+    "day": None,
+    "eq_start": None,
+    "best_sl": {},              # symbol -> float (never regress)
+    "last_trade_bar_ts": {},    # symbol -> ts
+}
+
+# сохраняем «снимок входа» для стабильного TP/SL
+state.setdefault("pos_snapshot", {})   # symbol -> {"entry":..., "init_contracts":..., "tp":..., "sl":...}
+state.setdefault("static_sl",   {})    # symbol -> sl_price для режима без сдвигов
+
+if "bot_positions" not in state:
+    state["bot_positions"] = {}   # symbol -> bool
+
+# ------------------------- Funding -------------------------
+def fetch_funding(symbol):
+    try:
+        fr = None
+        if exchange.has.get("fetchFundingRate"):
+            fr = exchange.fetch_funding_rate(symbol)
+        elif exchange.has.get("fetchFundingRates"):
+            arr = exchange.fetch_funding_rates([symbol])
+            fr = arr[0] if isinstance(arr,list) and arr else None
+        if not fr: return None
+        rate = float(fr.get("fundingRate") or 0.0)
+        nxt  = fr.get("nextFundingTimestamp") or fr.get("nextFundingTime")
+        if isinstance(nxt,str):
+            try: nxt=int(nxt)
+            except: nxt=None
+        if isinstance(nxt,(int,float)): nxt=int(nxt)
+        else: nxt=None
+        return {"rate":rate,"next_ts":nxt}
+    except Exception as e:
+        print(symbol, "funding warn:",e); return None
+
+def funding_risk_adjustment(symbol, side):
+    info = fetch_funding(symbol)
+    if not info: return 1.0, None, None
+    rate, nxt = info["rate"], info["next_ts"]
+    unfavorable = (side=="LONG" and rate>0) or (side=="SHORT" and rate<0)
+    if nxt:
+        secs = int(nxt/1000 - time.time())
+        if secs < FUNDING_NO_OPEN_WINDOW_SEC and unfavorable and abs(rate) >= 0.0001:
+            return 0.0, f"Funding in ~{secs//60}m unfavorable {rate*100:.3f}%", rate
+    if unfavorable and abs(rate) >= FUNDING_HARD_ABS:
+        return 0.0, f"Hard funding block {rate*100:.3f}%", rate
+    if unfavorable and abs(rate) >= FUNDING_SOFT_ABS:
+        return 0.5, f"Soft funding reduce {rate*100:.3f}%", rate
+    return 1.0, None, rate
+
+# ------------------------- Positions -------------------------
+def fetch_positions_map():
+    out = {}
+    try:
+        if not exchange.has.get("fetchPositions"): return out
+        for p in exchange.fetch_positions():
+            sym = p.get("symbol")
+            out[sym] = p
+    except Exception:
+        pass
+    return out
+
+def has_open_position(symbol, pos_map=None):
+    pm = pos_map or fetch_positions_map()
+    p = pm.get(symbol)
+    if not p: return False
+    return abs(float(p.get("contracts") or 0.0)) > 0
+
+def open_positions_count(pos_map=None):
+    pm = pos_map or fetch_positions_map()
+    ctr = 0
+    for p in pm.values():
+        if abs(float(p.get("contracts") or 0.0)) > 0: ctr+=1
+    return ctr
+
+# ------------------------- Sizing -------------------------
+def compute_position_size(eq, last_price, sl_price, symbol, leverage=1, risk=RISK_PER_TRADE):
+    risk_usd = eq * risk * (1 - 2*FEE_PCT)
+    per_unit = abs((last_price*(1+SLIPPAGE_PCT)) - sl_price)
+    if per_unit <= 0: return 0.0,0.0,0.0
+    raw_amount = risk_usd / per_unit
+    max_nominal = eq * MAX_NOTIONAL_PCT * leverage
+    nominal = raw_amount * last_price
+    if nominal > max_nominal:
+        raw_amount = max_nominal / last_price
+        nominal = raw_amount * last_price
+    amt = round_amount(symbol, raw_amount)
+    if amt <= 0: return 0.0,0.0,0.0
+    used_margin = nominal/max(leverage,1)
+    return amt, nominal, used_margin
+
+# ------------------------- Orders helpers -------------------------
+def fetch_open_orders_safe(symbol):
+    try: return exchange.fetch_open_orders(symbol)
+    except Exception as e:
+        print(symbol, "fetch_open_orders warn:", e); return []
+
+def is_reduce_only(o): return bool(o.get("reduceOnly"))
+def is_sl_order(o):
+    if not is_reduce_only(o): return False
+    t = (o.get("type") or "").lower()
+    if "stop" in t: return True
+    p = o.get("params") or {}
+    if any(k in p for k in ("stopPrice","triggerPrice","stopLossPrice")): return True
+    info = o.get("info") or {}
+    return isinstance(info,dict) and any(k in info for k in ("stopPrice","triggerPrice","stopLossPrice"))
+
+def _tp_present_good_enough(symbol, side_long, tp_target):
+    try:
+        opens = fetch_open_orders_safe(symbol)
+        thresh_lo = tp_target*(1-TP_PRICE_TOL_PCT)
+        thresh_sh = tp_target*(1+TP_PRICE_TOL_PCT)
+        for o in opens:
+            if not is_reduce_only(o): continue
+            px = o.get("price"); side=(o.get("side") or "").lower()
+            if px is None: continue
+            px = float(px)
+            if side_long and side=="sell" and px>=thresh_lo: return True
+            if (not side_long) and side=="buy" and px<=thresh_sh: return True
+        return False
+    except Exception: return False
+
+def cancel_reduce_only(symbol):
+    """Cancel all existing reduceOnly orders to avoid 101290 conflicts."""
+    try:
+        opens = fetch_open_orders_safe(symbol)
+        for o in opens:
+            if is_reduce_only(o):
+                try: exchange.cancel_order(o["id"], symbol)
+                except: pass
+    except Exception: pass
+
+def place_tp_order(symbol, pos_side_long, qty, tp_price, retries=4, sleep_sec=0.9):
+    """
+    Надёжная постановка reduceOnly лимит-TP.
+    - Маркируем clientOrderId (бот будет видеть только свои TP).
+    - Корректируем qty, если суммарные reduceOnly > contracts (код 101290).
+    - Считаем уже повешенные reduceOnly только от бота (_is_bot_order).
+    """
+    try:
+        side_close = 'sell' if pos_side_long else 'buy'
+
+        # Базовая цена
+        price = round_price(symbol, tp_price)
+
+        # (опционально) небольшая «подушка» по цене, если настроена
+        try:
+            if TP_PRICE_PADDING_TICKS:
+                mkt = get_market(symbol) or {}
+                price_prec = (mkt.get('precision') or {}).get('price', 8)
+                tick = 10 ** (-int(price_prec or 8))
+                price = round_price(
+                    symbol,
+                    price + (TP_PRICE_PADDING_TICKS * tick if pos_side_long else -TP_PRICE_PADDING_TICKS * tick)
+                )
+        except Exception:
+            pass
+
+        q_try = round_amount(symbol, qty)
+        if q_try <= 0:
+            return None
+
+        last_err = None
+        for _ in range(max(1, int(retries))):
+            try:
+                # актуализируем позицию
+                pos_map = fetch_positions_map()
+                p = pos_map.get(symbol) or {}
+                contracts = abs(float(p.get('contracts') or 0.0))
+                if contracts <= 0:
+                    return None  # позиции нет — ставить нечего
+
+                # открытые ордера (фильтруем только бот-ордера)
+                opens = fetch_open_orders_safe(symbol)
+                bot_opens = [o for o in opens if _is_bot_order(o)]
+
+                # сколько reduceOnly уже висит на стороне закрытия (только наши)
+                existing_ro = _sum_reduce_only_qty_bot(bot_opens, side_close)
+
+                # остаток, который можно повесить как reduceOnly
+                allowance = max(0.0, contracts - existing_ro)
+                q_eff = round_amount(symbol, min(q_try, allowance))
+                if q_eff <= 0:
+                    return None
+
+                params = {
+                    'reduceOnly': True,
+                    'clientOrderId': make_cid("tp"),   # <— маркировка нашего TP
+                }
+
+                return exchange.create_order(symbol, 'limit', side_close, q_eff, price, params)
+
+            except Exception as e:
+                msg = str(e)
+                last_err = msg
+
+                # Классика: "The Reduce Only order can only decrease the position..." (код 101290)
+                if '101290' in msg or 'Reduce Only' in msg:
+                    # чуть уменьшим попытку и повторим
+                    time.sleep(sleep_sec)
+                    q_try = round_amount(symbol, max(q_try * 0.75, q_try - max(q_try * 0.25, 1e-9)))
+                    continue
+
+                # иные ошибки — пауза и повтор
+                time.sleep(sleep_sec)
+
+        print(f"{symbol}: place_tp warn: {last_err}")
+        return None
+
+    except Exception as e:
+        print(f"{symbol}: place_tp fatal warn: {e}")
+        return None
+
+SL_MARKET_PARAMS_LIST = [
+    {"type":"stop","stopPrice":None,"reduceOnly":True},
+    {"type":"stop","triggerPrice":None,"reduceOnly":True},
+    {"stopLossPrice":None,"reduceOnly":True},
+]
+
+def place_sl_order(symbol, side_long, qty, sl_price, retries=3, sleep_sec=0.8):
+    """
+    Постановка reduceOnly стоп-маркета (SL) с защитой от 101290 и маркировкой clientOrderId.
+    - side_long: True (лонг) -> ставим SELL SL, иначе BUY SL.
+    - qty автоматически уменьшается до доступного остатка (contracts - уже висящие наши SL).
+    - пробуем несколько параметризаций из SL_MARKET_PARAMS_LIST.
+    """
+    try:
+        side_close = "sell" if side_long else "buy"
+        price = round_price(symbol, sl_price)
+
+        # --- актуализируем позицию
+        pos_map = fetch_positions_map()
+        p = pos_map.get(symbol) or {}
+        contracts = abs(float(p.get('contracts') or 0.0))
+        if contracts <= 0:
+            # позиции нет — ставить SL нечего
+            return None
+
+        # --- уже открытые ордера: считаем только наши reduceOnly SL на той же стороне
+        opens = fetch_open_orders_safe(symbol)
+        bot_opens = [o for o in opens if _is_bot_order(o)]
+        existing_sl_qty = 0.0
+        for o in bot_opens:
+            try:
+                if not o.get("reduceOnly"):
+                    continue
+                if not is_sl_order(o):
+                    continue
+                if (o.get("side") or "").lower() != side_close:
+                    continue
+                amt = float(o.get("amount") or 0.0)
+                if amt > 0:
+                    existing_sl_qty += amt
+            except Exception:
+                continue
+
+        # сколько ещё можно повесить reduceOnly-стопов
+        allowance = max(0.0, contracts - existing_sl_qty)
+        q_try = round_amount(symbol, min(qty, allowance))
+        if q_try <= 0:
+            # стоп уже повешен достаточным объёмом
+            return None
+
+        last_err = None
+        for _ in range(max(1, int(retries))):
+            # пробуем разные формы стопа (BingX капризен)
+            for tpl in SL_MARKET_PARAMS_LIST:
+                try:
+                    params = dict(tpl)
+                    # всегда reduceOnly
+                    params["reduceOnly"] = True
+                    # маркируем наш SL
+                    params["clientOrderId"] = make_cid("sl")
+
+                    # расставляем ключи цены
+                    for k in ("stopPrice", "triggerPrice", "stopLossPrice"):
+                        if k in params and params[k] is None:
+                            params[k] = price
+
+                    q_eff = round_amount(symbol, min(q_try, allowance))
+                    if q_eff <= 0:
+                        return None
+
+                    o = exchange.create_order(symbol, "market", side_close, q_eff, None, params)
+                    # успех
+                    ensure_json_log({
+                        "ts": now_utc().isoformat(),
+                        "event": "SL_ORDER",
+                        "symbol": symbol,
+                        "amount": q_eff,
+                        "price": price,
+                        "side": side_close,
+                        "order_id": (o.get("id") if isinstance(o, dict) else None),
+                    })
+                    return o
+
+                except Exception as e:
+                    msg = str(e)
+                    last_err = msg
+
+                    # Классика: Reduce Only can only decrease... (101290) — уменьшаем попытку
+                    if "101290" in msg or "Reduce Only" in msg:
+                        # пересчитаем allowance на всякий случай (пока мы пытались, что-то могло измениться)
+                        opens = fetch_open_orders_safe(symbol)
+                        bot_opens = [o for o in opens if _is_bot_order(o)]
+                        existing_sl_qty = 0.0
+                        for o2 in bot_opens:
+                            try:
+                                if not o2.get("reduceOnly"): 
+                                    continue
+                                if not is_sl_order(o2):
+                                    continue
+                                if (o2.get("side") or "").lower() != side_close:
+                                    continue
+                                amt2 = float(o2.get("amount") or 0.0)
+                                if amt2 > 0:
+                                    existing_sl_qty += amt2
+                            except Exception:
+                                continue
+                        allowance = max(0.0, contracts - existing_sl_qty)
+
+                        # снизим q_try и повторим
+                        q_try = round_amount(symbol, max(q_try * 0.75, allowance))
+                        time.sleep(sleep_sec)
+                        continue  # пробуем следующий tpl / круг
+
+                    # другие ошибки — задержка и попробовать следующий шаблон
+                    time.sleep(sleep_sec)
+                    continue
+
+        print(f"{symbol}: place_sl warn: {last_err}")
+        ensure_json_log({
+            "ts": now_utc().isoformat(),
+            "event": "SL_WARN",
+            "symbol": symbol,
+            "error": last_err,
+            "price": price,
+            "qty": q_try,
+        })
+        return None
+
+    except Exception as e:
+        print(f"{symbol}: place_sl fatal warn: {e}")
+        ensure_json_log({
+            "ts": now_utc().isoformat(),
+            "event": "SL_FATAL",
+            "symbol": symbol,
+            "error": str(e),
+            "price": sl_price,
+            "qty": qty,
+        })
+        return None
+
+# ------------------------- Wait position -------------------------
+def wait_for_position_open(symbol, expect_long, timeout_sec=12, poll_int=0.6):
+    t0=time.time()
+    while time.time()-t0<timeout_sec:
+        try:
+            pm=fetch_positions_map(); p=pm.get(symbol)
+            if p:
+                c=float(p.get("contracts") or 0.0)
+                if abs(c)>0: return p
+        except Exception: pass
+        time.sleep(poll_int)
+    return None
+
+# ------------------------- Signals (very compact) -------------------------
+def generate_signal(df, d_htf):
+    if len(df)<3 or len(d_htf)<3: return "HOLD","no data"
+    prev2, prev = df.iloc[-3], df.iloc[-2]
+
+    # Trend filter by HTF
+    h = d_htf.iloc[-2]
+    up   = h["close"]>h["EMA200"] and h["EMA20"]>h["EMA50"]>h["EMA200"]
+    down = h["close"]<h["EMA200"] and h["EMA20"]<h["EMA50"]<h["EMA200"]
+
+    # Momentum
+    bull = prev2["RSI"]<30 and prev["RSI"]>=30 and prev["MACD_hist"]>0
+    bear = prev2["RSI"]>70 and prev["RSI"]<=70 and prev["MACD_hist"]<0
+
+    if up and bull: return "LONG","rsi/macd + uptrend"
+    if down and bear: return "SHORT","rsi/macd + downtrend"
+    return "HOLD","no convergence"
+
+# ------------------------- Trade -------------------------
+def place_trade(symbol, signal, df, usdt_balance_cached=None, positions_map=None, closed_bar=None,
+                risk_mult_override=1.0, leverage_override=None, tag=None):
+    """
+    Вход рыночным ордером, затем — единственный TP (полное закрытие) и SL.
+    SL НЕ двигаем далее (MOVE_SL_DYNAMIC=False).
+    """
+    m = get_market(symbol)
+    is_swap = bool(m and m.get('contract'))
+
+    # Баланс
+    if usdt_balance_cached is None:
+        try:
+            bal = exchange.fetch_balance()
+            usdt_balance_cached = float(bal['total'].get('USDT', 0))
+        except Exception as e:
+            print(f"{symbol}: balance fail: {e}")
+            return False
+
+    last_price = float(df.iloc[-1]['close'])
+    atr_val    = float(df.iloc[-1]['ATR'])
+
+    # --- SL базовый ---
+    side_long = (signal == 'LONG')
+    if SL_METHOD.upper() == "SWING":
+        sw = swing_stop_from(df, side_long=side_long)
+        if sw is None:
+            sl = (last_price - SL_ATR_MULT * atr_val) if side_long else (last_price + SL_ATR_MULT * atr_val)
+        else:
+            sl = sw
+    else:
+        sl = (last_price - SL_ATR_MULT * atr_val) if side_long else (last_price + SL_ATR_MULT * atr_val)
+
+    # волатильность
+    if (atr_val / max(last_price, 1e-9)) > MAX_ATR_PCT:
+        ensure_json_log({"ts": now_utc().isoformat(), "event":"HOLD", "symbol":symbol, "reason":"ATR too big"})
+        return False
+
+    # funding
+    fund_mult, fund_reason, fund_rate = funding_risk_adjustment(symbol, 'LONG' if side_long else 'SHORT')
+    if fund_mult == 0.0:
+        ensure_json_log({"ts": now_utc().isoformat(),"event":"HOLD","symbol":symbol,"reason":f"FUNDING_BLOCK: {fund_reason}","funding_rate":fund_rate>
+        return False
+
+    # плечо
+    lev = leverage_override if (tag == "PREPUMP" and leverage_override is not None) else (LEVERAGE if is_swap else 1)
+
+    # риск
+    reg = fetch_market_regime()
+    dyn_risk = regime_adjust_risk(RISK_PER_TRADE, reg["btc_dominance"], reg["dxy_trend"])
+    dyn_risk *= fund_mult
+    dyn_risk *= max(0.1, float(risk_mult_override))
+
+    # размер
+    amount, nominal, used_margin = compute_position_size(usdt_balance_cached, last_price, sl, symbol, leverage=lev, risk_per_trade=dyn_risk)
+    if amount <= 0:
+        ensure_json_log({"ts": now_utc().isoformat(), "event":"HOLD", "symbol":symbol, "reason":"size<=0"})
+        return False
+
+    # режимы на бирже (best-effort)
+    if is_swap:
+        try:
+            try: exchange.set_margin_mode('cross', symbol)
+            except Exception: pass
+            try: exchange.set_position_mode(False, symbol)  # one-way
+            except Exception: pass
+            try: exchange.set_leverage(lev, symbol, {'side':'BOTH'})
+            except Exception: pass
+        except Exception as e:
+            print(f"{symbol}: leverage/mode warn: {e}")
+
+    side = 'buy' if side_long else 'sell'
+    entry_report = {
+        "ts": now_utc().isoformat(), "event":"ENTRY_PREPARE", "mode":MODE, "symbol":symbol,
+        "signal":signal, "amount":amount, "entry_price":last_price,
+        "sl": round_price(symbol, sl), "nominal": nominal, "used_margin": used_margin,
+        "dry": DRY_RUN, "tag": tag, "funding_rate": fund_rate, "funding_risk_mult": fund_mult,
+    }
+    ensure_json_log(entry_report)
+
+    # вход
+    try:
+        if DRY_RUN:
+            print(f"[DRY] market {side} {amount} {symbol}")
+            ensure_json_log({**entry_report, "event":"ENTRY_DRY"})
+            return {"dry": True}
+
+        params_entry = {'clientOrderId': make_cid("entry")}
+        order = exchange.create_order(symbol, 'market', side, amount, None, params_entry)
+        oid = (order or {}).get('id')
+        ensure_json_log({**entry_report, "event":"ENTRY", "order_id": oid})
+    except Exception as e:
+        ensure_json_log({**entry_report, "event":"ENTRY_ERROR", "error": str(e)})
+        return False
+
+    # подтверждение позиции
+    pos_info = wait_for_position_open(symbol, side_long, timeout_sec=12, poll_int=0.6)
+    if not pos_info:
+        print(f"{symbol}: no position yet – manager will handle")
+        return True
+
+    contracts_now = abs(float(pos_info.get('contracts') or 0.0))
+    entry_px      = float(pos_info.get('entryPrice') or last_price)
+
+    # единица риска и TP1
+    r_unit   = abs(entry_px - sl)
+    tp1_price = entry_px + FULL_TP_R * r_unit if side_long else entry_px - FULL_TP_R * r_unit
+    tp1_price = round_price(symbol, tp1_price)
+    sl_r      = round_price(symbol, sl)
+
+    # сначала «чистим» reduceOnly, чтобы не ловить 101290
+    cancel_reduce_only(symbol)
+
+    # --- TP (единственный): ВСЯ позиция ---
+    tp_qty = round_amount(symbol, contracts_now)
+    if tp_qty > 0:
+        tp_ok = place_tp_order(symbol, side_long, tp_qty, tp1_price, retries=4, sleep_sec=1.0)
+        if tp_ok:
+            ensure_json_log({"ts": now_utc().isoformat(), "event":"TP_ORDER", "symbol":symbol,
+                             "amount": tp_qty, "price": tp1_price, "order_id": tp_ok.get('id')})
+        else:
+            print(f"{symbol}: TP placement deferred (manager will add)")
+
+    # --- SL (фикс): НЕ двигаем далее ---
+    sl_ok = place_sl_order(symbol, side_long, contracts_now, sl_r)
+    if sl_ok:
+        ensure_json_log({"ts": now_utc().isoformat(), "event":"SL_ORDER", "symbol":symbol,
+                         "amount": contracts_now, "price": sl_r, "order_id": sl_ok.get('id')})
+
+    # сохраняем снимок
+    try:
+        state["pos_snapshot"][symbol] = {
+            "entry": float(entry_px),
+            "init_contracts": float(contracts_now),
+            "tp": float(tp1_price),
+            "sl": float(sl_r),
+        }
+        state["static_sl"][symbol] = float(sl_r)
+    except Exception:
+        pass
+
+    state.setdefault("bot_positions", {})[symbol] = True
+    ensure_json_log({"ts": now_utc().isoformat(), "event": "BOT_OWNS_POSITION", "symbol": symbol})
+
+    return True
+
+# ------------------------- Management -------------------------
+def manage_positions(df_map):
+    """
+    Single-TP режим: контролируем, чтобы был один TP (на весь остаток) и один SL.
+    SL не двигаем. Если биржа «съела»/отменила — дозаводим.
+    """
+    if globals().get('DRY_RUN', False):
+        return
+
+    positions = fetch_positions_map()
+    if not positions:
+        return
+
+    for symbol, p in positions.items():
+        try:
+            contracts = float(p.get('contracts') or 0.0)
+            if abs(contracts) <= 0:
+                continue
+
+            side_long = (contracts > 0)
+            entry     = float(p.get('entryPrice') or 0.0) or float(p.get('markPrice') or 0.0)
+            last      = float(p.get('markPrice') or 0.0)
+
+            snap = (state.get("pos_snapshot") or {}).get(symbol) or {}
+            # базовый SL/TP из снапшота; если вдруг нет — пересчитаем по текущему ATR (крайний случай)
+            sl_fixed = state.get("static_sl", {}).get(symbol)
+            if sl_fixed is None:
+                df = df_map.get(symbol)
+                if df is not None and not df.empty:
+                    atr = float(df.iloc[-1]['ATR'])
+                    base_sl = entry - SL_ATR_MULT * atr if side_long else entry + SL_ATR_MULT * atr
+                else:
+                    base_sl = float(p.get('stopLossPrice') or 0.0) or entry  # fallback
+                sl_fixed = round_price(symbol, base_sl)
+                state.setdefault("static_sl", {})[symbol] = sl_fixed
+
+            if snap and "tp" in snap:
+                tp_target = float(snap["tp"])
+            else:
+                # если нет снапшота — пересчёт TP по текущему SL (чтобы не остаться без TP)
+                r_unit = abs(entry - sl_fixed)
+                tp_target = entry + FULL_TP_R * r_unit if side_long else entry - FULL_TP_R * r_unit
+                tp_target = round_price(symbol, tp_target)
+
+            # проверяем открытые ордера
+            opens = fetch_open_orders_safe(symbol)
+            have_tp = False
+            have_sl = False
+            for o in opens:
+                if is_sl_order(o):
+                    have_sl = True
+                elif o.get('reduceOnly'):
+                    # это TP-кандидат
+                    side = (o.get('side') or '').lower()
+                    px   = o.get('price')
+                    if px is None:
+                        continue
+                    px = float(px)
+                    if side_long and side == 'sell':
+                        if px >= tp_target * (1 - TP_PRICE_TOL_PCT):
+                            have_tp = True
+                    if (not side_long) and side == 'buy':
+                        if px <= tp_target * (1 + TP_PRICE_TOL_PCT):
+                            have_tp = True
+
+            # Дозавод TP (на весь остаток)
+            if not have_tp:
+                # отменим все reduceOnly перед постановкой (борьба с 101290)
+                cancel_reduce_only(symbol)
+                qty = round_amount(symbol, abs(contracts))
+                if qty > 0:
+                    o = place_tp_order(symbol, side_long, qty, tp_target, retries=4, sleep_sec=1.0)
+                    if o:
+                        print(f"{symbol}: TP_RENEW -> {qty} @ {tp_target}")
+                        ensure_json_log({"ts": now_utc().isoformat(), "event":"TP_RENEW", "symbol":symbol,
+                                         "amount": qty, "price": tp_target, "order_id": o.get('id')})
+
+            # Дозавод SL (если отсутствует). НЕ двигаем, только если вообще нет.
+            if not have_sl:
+                o = place_sl_order(symbol, side_long, abs(contracts), sl_fixed)
+                if o:
+                    print(f"{symbol}: SL_RENEW -> @ {sl_fixed}")
+                    ensure_json_log({"ts": now_utc().isoformat(), "event":"SL_RENEW", "symbol":symbol,
+                                     "price": sl_fixed, "order_id": o.get('id')})
+
+            # НИКАКИХ переносов SL (ни BE, ни трейла) — MOVE_SL_DYNAMIC=False
+            # Специально ничего не делаем.
+
+        except Exception as e:
+            print(f"{symbol}: manage_positions warn: {e}")
+
+# ------------------------- Main loop -------------------------
+def align_to_next_candle(tf_seconds):
+    now=int(time.time())
+    wait=tf_seconds - (now%tf_seconds) + 2
+    print(f"\nWait ~{wait}s to next close"); time.sleep(wait)
+
+def can_trade_today(eq):
+    today = date.fromtimestamp(time.time())
+    if state["day"]!=today:
+        state["day"]=today; state["eq_start"]=eq
+        print(PRINT_PREFIX,"New day equity=",eq)
+        return True
+    dd = (state["eq_start"]-eq)/max(state["eq_start"],1) if state["eq_start"] else 0
+    if dd>=MAX_DAILY_DD:
+        print(PRINT_PREFIX, "Daily DD hit", dd)
+        return False
+    return True
+
+def main():
+    print("Symbols:", ", ".join(SYMBOLS_TO_TRADE), "| TF:", TIMEFRAME_ENTRY, "HTF:", TIMEFRAME_HTF)
+    tf_sec = timeframe_seconds(TIMEFRAME_ENTRY)
+    while True:
+        try:
+            bal = exchange.fetch_balance()
+            eq  = float(bal["total"].get("USDT",0))
+        except Exception as e:
+            print("balance warn:",e); eq=None
+
+        if eq is not None and not can_trade_today(eq):
+            align_to_next_candle(tf_sec); continue
+        if AVOID_HOURS_UTC and datetime.utcnow().hour in AVOID_HOURS_UTC:
+            print(PRINT_PREFIX,"sleep trading window"); align_to_next_candle(tf_sec); continue
+
+        dfmap={}
+        pos_map = fetch_positions_map()
+
+        for symbol in SYMBOLS_TO_TRADE:
+            print("="*72, "\n", symbol, now_utc())
+            try:
+                df = add_indicators(fetch_ohlcv(symbol, TIMEFRAME_ENTRY, 400))
+                dH = add_indicators(fetch_ohlcv(symbol, TIMEFRAME_HTF, 400))
+                if df.empty or dH.empty:
+                    ensure_json_log({"event":"HOLD","symbol":symbol,"reason":"no data"}); continue
+                dfmap[symbol]=df
+                sig, why = generate_signal(df, dH)
+                print("Signal:",sig, "|", why)
+
+                if sig!="HOLD" and not has_open_position(symbol, pos_map):
+                    place_trade(symbol, sig, df, usdt_balance_cached=eq, positions_map=pos_map)
+            except Exception as e:
+                print(symbol,"cycle warn:",e)
+
+        manage_positions(dfmap)
+        align_to_next_candle(tf_sec)
+
+if __name__=="__main__":
+    main()
