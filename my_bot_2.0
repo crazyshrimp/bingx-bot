@@ -192,7 +192,7 @@ def add_indicators(df):
     d.dropna(inplace=True)
     return d
 
-    def _sum_reduce_only_qty(opens, close_side: str) -> float:
+def _sum_reduce_only_qty(opens, close_side: str) -> float:
     """
     Считает суммарный qty всех reduceOnly ордеров на стороне закрытия позиции.
     close_side: 'buy' (закрывает SHORT) или 'sell' (закрывает LONG)
